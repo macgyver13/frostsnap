@@ -490,6 +490,8 @@ impl SigningSessionHandle {
                     ctx.remote_sign_session_id,
                     device_id,
                     &ctx.all_binonces,
+                    // TODO: pass the confirmed subset's silent payment shares once the app posts SP sends.
+                    None,
                     encryption_key,
                 )?),
             })?
@@ -959,7 +961,7 @@ impl Coordinator {
             .coordinator
             .lock()
             .unwrap()
-            .can_sign_with_nonce_reservation(&all_binonces, id, device_id)
+            .can_sign_with_nonce_reservation(&all_binonces, None, id, device_id)
     }
 }
 

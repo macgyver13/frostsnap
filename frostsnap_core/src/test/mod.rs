@@ -206,6 +206,15 @@ pub trait Env {
                     .unwrap();
                 run.extend_from_device(from, sign_ack);
             }
+            DeviceToUserMessage::SpEcdhRequest { phase } => {
+                let ack = run.participants[ci]
+                    .devices
+                    .get_mut(&from)
+                    .unwrap()
+                    .sp_ecdh_ack(*phase, &mut TestDeviceKeyGen, rng)
+                    .unwrap();
+                run.extend_from_device(from, ack);
+            }
             DeviceToUserMessage::Restoration(restoration) => {
                 use crate::device::restoration::ToUserRestoration::*;
                 if let ConsolidateBackup(phase) = *restoration {

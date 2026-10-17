@@ -1339,6 +1339,27 @@ impl FrostCoordinator {
         encryption_key: SymmetricKey,
         rng: &mut impl rand_core::RngCore,
     ) -> Result<(SpEcdhSessionId, Vec<CoordinatorSend>), StartSignError> {
+        self.begin_sp_ecdh(
+            access_structure_ref,
+            sign_task,
+            ecdh_devices,
+            true,
+            encryption_key,
+            rng,
+        )
+    }
+
+    /// Starts the ECDH session of `start_sp_ecdh`. A remote participant asks only its own device,
+    /// so `require_threshold` is off there and one device is enough.
+    pub(super) fn begin_sp_ecdh(
+        &mut self,
+        access_structure_ref: AccessStructureRef,
+        sign_task: WireSignTask,
+        ecdh_devices: &BTreeSet<DeviceId>,
+        require_threshold: bool,
+        encryption_key: SymmetricKey,
+        rng: &mut impl rand_core::RngCore,
+    ) -> Result<(SpEcdhSessionId, Vec<CoordinatorSend>), StartSignError> {
         let AccessStructureRef {
             key_id,
             access_structure_id,
@@ -1362,7 +1383,12 @@ impl FrostCoordinator {
         }
 
         let selected = ecdh_devices.len();
-        if selected < access_structure.threshold() as usize {
+        let needed = if require_threshold {
+            access_structure.threshold() as usize
+        } else {
+            1
+        };
+        if selected < needed {
             return Err(StartSignError::NotEnoughDevicesSelected {
                 selected,
                 threshold: access_structure.threshold(),
@@ -2253,6 +2279,13 @@ pub enum StartSignError {
         threshold: u16,
     },
     SilentPaymentFailed,
+    /// A remote offer's or subset's silent payment ECDH shares were missing or did not verify.
+    SilentPaymentShares(&'static str),
+    /// The task a signer was handed is not the committed template completed from the subset's
+    /// ECDH shares.
+    SilentPaymentTaskMismatch,
+    /// The device's ECDH shares for this remote offer have not arrived.
+    SilentPaymentSharesMissing,
 }
 
 impl fmt::Display for StartSignError {
@@ -2311,6 +2344,16 @@ impl fmt::Display for StartSignError {
                     f,
                     "the silent payment outputs could not be derived from the shares"
                 )
+            }
+            StartSignError::SilentPaymentShares(reason) => {
+                write!(f, "silent payment ECDH shares were refused: {reason}")
+            }
+            StartSignError::SilentPaymentTaskMismatch => write!(
+                f,
+                "the task is not the committed template completed from the subset's ECDH shares"
+            ),
+            StartSignError::SilentPaymentSharesMissing => {
+                write!(f, "the device's silent payment ECDH shares have not arrived")
             }
         }
     }
