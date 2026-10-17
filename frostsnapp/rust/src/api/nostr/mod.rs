@@ -528,7 +528,7 @@ impl ChannelHandle {
 
     /// Pump a wallet-stream tx into the channel runner so it can fold
     /// chat→tx correlations.
-    pub async fn notify_tx_observed(&self, tx: crate::api::bitcoin::Transaction) -> Result<()> {
+    pub async fn notify_tx_observed(&self, tx: &crate::api::bitcoin::Transaction) -> Result<()> {
         let wallet_tx = frostsnap_coordinator::bitcoin::wallet::Transaction {
             inner: std::sync::Arc::new(tx.inner.clone()),
             txid: tx.inner.compute_txid(),
