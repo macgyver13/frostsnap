@@ -19,8 +19,15 @@ use frostsnap_core::coordinator::FrostCoordinator;
 pub use frostsnap_core::coordinator::{
     ParticipantBinonces, ParticipantSignatureShares, SignSessionProgress, StartSign,
 };
+use frostsnap_core::message::signing::SpEcdhSessionId;
 use frostsnap_core::MasterAppkey;
 pub use frostsnap_core::WireSignTask;
+
+use super::nostr::{EcdhShare, SpSubset};
+use frostsnap_core::coordinator::{
+    CoordinatorToUserMessage, CoordinatorToUserSigningMessage, StartSignError,
+};
+
 use frostsnap_core::{
     message::EncodedSignature, AccessStructureRef, DeviceId, KeyId, SignSessionId, SymmetricKey,
 };
@@ -32,6 +39,12 @@ use tracing::{event, Level};
 
 #[frb(mirror(RemoteSignSessionId), non_opaque)]
 pub struct _RemoteSignSessionId(pub [u8; 32]);
+#[derive(Clone, Debug)]
+#[frb]
+pub struct SpSignOffer {
+    pub binonces: ParticipantBinonces,
+    pub sp_ecdh: Vec<EcdhShare>,
+}
 
 /// An outgoing Bitcoin transaction that has not been successfully broadcast.
 ///
@@ -440,6 +453,7 @@ pub struct SigningSessionHandle {
 struct RemoteSigningContext {
     remote_sign_session_id: RemoteSignSessionId,
     all_binonces: Vec<ParticipantBinonces>,
+    sp: Option<SpSubset>,
 }
 
 impl SigningSessionHandle {
@@ -490,8 +504,7 @@ impl SigningSessionHandle {
                     ctx.remote_sign_session_id,
                     device_id,
                     &ctx.all_binonces,
-                    // TODO: pass the confirmed subset's silent payment shares once the app posts SP sends.
-                    None,
+                    ctx.sp.as_ref(),
                     encryption_key,
                 )?),
             })?
@@ -684,6 +697,7 @@ impl Coordinator {
         all_binonces: Vec<ParticipantBinonces>,
         targets: Vec<DeviceId>,
         got_signatures: Vec<DeviceId>,
+        sp: Option<SpSubset>,
     ) -> Result<SigningSessionHandle> {
         anyhow::ensure!(!targets.is_empty(), "targets cannot be empty");
 
@@ -698,14 +712,19 @@ impl Coordinator {
             (session.access_structure_ref, session.sign_task.clone())
         };
 
-        let unsigned_tx = match &sign_task {
+        let effective_sign_task = sp
+            .as_ref()
+            .map(|s| s.completed_task.clone())
+            .unwrap_or(sign_task.clone());
+
+        let unsigned_tx = match &effective_sign_task {
             WireSignTask::BitcoinTransaction(template) => Some(UnsignedTx {
                 template_tx: template.clone(),
             }),
             WireSignTask::Test { .. } | WireSignTask::Nostr { .. } => None,
         };
         let session_id = frostsnap_core::message::GroupSignReq::from_binonces(
-            sign_task,
+            effective_sign_task,
             access_structure_ref.access_structure_id,
             &all_binonces,
         )
@@ -739,6 +758,7 @@ impl Coordinator {
             Some(RemoteSigningContext {
                 remote_sign_session_id,
                 all_binonces,
+                sp,
             }),
             unsigned_tx,
         ))
@@ -924,6 +944,101 @@ impl Coordinator {
             Ok(offer.participant_binonces)
         })
     }
+    pub fn reserve_nonces_sp(
+        &self,
+        id: RemoteSignSessionId,
+        access_structure_ref: AccessStructureRef,
+        sign_task: &WireSignTask,
+        device_id: DeviceId,
+        encryption_key: SymmetricKey,
+    ) -> Result<SpSignOffer> {
+        let dummy_ecdh = SpEcdhSessionId([0; 32]);
+        let early = {
+            let mut db = self.0.db.lock().unwrap();
+            let mut coord = self.0.coordinator.lock().unwrap();
+            coord.staged_mutate(&mut *db, |coordinator| {
+                match coordinator.offer_to_sign_sp(
+                    id,
+                    access_structure_ref,
+                    sign_task.clone(),
+                    device_id,
+                    dummy_ecdh,
+                ) {
+                    Ok(offer) => Ok(Some(offer)),
+                    Err(StartSignError::NoSuchSilentPaymentSession) => Ok(None),
+                    Err(e) => Err(anyhow::anyhow!(e)),
+                }
+            })?
+        };
+        if let Some(offer) = early {
+            return Ok(SpSignOffer {
+                binonces: offer.participant_binonces,
+                sp_ecdh: offer.sp_ecdh,
+            });
+        }
+
+        let (ecdh_session, msgs) = {
+            let mut db = self.0.db.lock().unwrap();
+            let mut coord = self.0.coordinator.lock().unwrap();
+            coord.staged_mutate(&mut *db, |coordinator| {
+                coordinator
+                    .start_remote_sp_ecdh(
+                        access_structure_ref,
+                        sign_task.clone(),
+                        device_id,
+                        encryption_key,
+                        &mut rand::thread_rng(),
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))
+            })?
+        };
+        self.0.usb_sender.send_from_core(msgs);
+
+        let success = self
+            .0
+            .block_for_to_user_message([device_id], move |to_user| {
+                if let CoordinatorToUserMessage::Signing(
+                    CoordinatorToUserSigningMessage::GotSpEcdhShares { session_id, from },
+                ) = to_user
+                {
+                    session_id == ecdh_session && from == device_id
+                } else {
+                    false
+                }
+            });
+
+        if !success {
+            let mut db = self.0.db.lock().unwrap();
+            let mut coord = self.0.coordinator.lock().unwrap();
+            let _ = coord.staged_mutate(&mut *db, |coordinator| {
+                coordinator.cancel_sp_ecdh(ecdh_session);
+                Ok(())
+            });
+            return Err(anyhow!(
+                "device disconnected or user canceled on the device"
+            ));
+        }
+
+        let offer = {
+            let mut db = self.0.db.lock().unwrap();
+            let mut coord = self.0.coordinator.lock().unwrap();
+            coord.staged_mutate(&mut *db, |coordinator| {
+                coordinator
+                    .offer_to_sign_sp(
+                        id,
+                        access_structure_ref,
+                        sign_task.clone(),
+                        device_id,
+                        ecdh_session,
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))
+            })?
+        };
+        Ok(SpSignOffer {
+            binonces: offer.participant_binonces,
+            sp_ecdh: offer.sp_ecdh,
+        })
+    }
 
     pub fn cancel_remote_sign_session(&self, id: RemoteSignSessionId) -> Result<()> {
         let mut db = self.0.db.lock().unwrap();
@@ -954,6 +1069,7 @@ impl Coordinator {
     pub fn can_sign_with_nonce_reservation(
         &self,
         all_binonces: Vec<ParticipantBinonces>,
+        sp: Option<SpSubset>,
         id: RemoteSignSessionId,
         device_id: DeviceId,
     ) -> bool {
@@ -961,7 +1077,7 @@ impl Coordinator {
             .coordinator
             .lock()
             .unwrap()
-            .can_sign_with_nonce_reservation(&all_binonces, None, id, device_id)
+            .can_sign_with_nonce_reservation(&all_binonces, sp.as_ref(), id, device_id)
     }
 }
 
