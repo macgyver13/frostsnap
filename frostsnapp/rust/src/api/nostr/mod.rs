@@ -548,13 +548,13 @@ impl ChannelHandle {
     pub fn seal_round_confirmed(
         &self,
         request_id: EventId,
-        sign_task: WireSignTask,
-        binonces: Vec<ParticipantBinonces>,
+        sign_task: &WireSignTask,
+        binonces: Vec<RustAutoOpaque<ParticipantBinonces>>,
     ) -> Result<SealedSigningData> {
         Ok(SealedSigningData {
             request_id: request_id.into(),
-            sign_task,
-            binonces,
+            sign_task: sign_task.clone(),
+            binonces: binonces.iter().map(|b| b.blocking_read().clone()).collect(),
             key_context: self.key_context.clone(),
         })
     }
@@ -1232,10 +1232,10 @@ pub fn signing_details(sign_task: &WireSignTask) -> super::signing::SigningDetai
 /// of `SigningEvent::Offer.binonces`. Dart calls this on demand; the
 /// field used to ride embedded on the variant.
 #[frb(sync)]
-pub fn offer_share_indices(binonces: &[ParticipantBinonces]) -> Vec<u32> {
+pub fn offer_share_indices(binonces: Vec<RustAutoOpaque<ParticipantBinonces>>) -> Vec<u32> {
     binonces
         .iter()
-        .map(|b| u32::try_from(b.share_index).expect("share index fits in u32"))
+        .map(|b| u32::try_from(b.blocking_read().share_index).expect("share index fits in u32"))
         .collect()
 }
 
