@@ -1,15 +1,24 @@
 use alloc::vec::Vec;
-use alloc::{boxed::Box, collections::BTreeMap};
+use alloc::{
+    boxed::Box,
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+};
 use bitcoin::{
     consensus::Encodable,
     hashes::{sha256d, Hash},
-    key::TweakedPublicKey,
+    key::{TweakedPublicKey, XOnlyPublicKey},
     sighash::SighashCache,
     OutPoint, Script, ScriptBuf, TapSighash, TxOut, Txid,
 };
+use schnorr_fun::{
+    frost::ShareIndex,
+    fun::{marker::*, Point, Scalar},
+};
 
 use crate::{
-    tweak::{AppTweak, BitcoinBip32Path},
+    silent_payments::{self, combine_ecdh_shares, output_keys, EcdhShare, SilentPaymentRecipient},
+    tweak::{AppTweak, BitcoinAccount, BitcoinBip32Path, TweakContext},
     MasterAppkey,
 };
 
@@ -257,6 +266,117 @@ impl TransactionTemplate {
             .checked_sub(self.outputs.iter().map(|output| output.value).sum())
     }
 
+    /// A silent payment to `recipient`, whose script is filled in by [`Self::with_sp_scripts`]
+    /// once the ECDH shares are combined. `address` is the recipient's address as the user gave
+    /// it, shown to the signer.
+    pub fn push_silent_payment_output(
+        &mut self,
+        value: bitcoin::Amount,
+        recipient: SilentPaymentRecipient,
+        address: String,
+    ) {
+        self.outputs.push(Output {
+            owner: SpkOwner::SilentPayment(Box::new(SilentPaymentOutput {
+                recipient,
+                address,
+                script: None,
+            })),
+            value: value.to_sat(),
+        });
+    }
+
+    /// The silent payment outputs in transaction order.
+    pub fn silent_payment_outputs(&self) -> impl Iterator<Item = &SilentPaymentOutput> {
+        self.outputs
+            .iter()
+            .filter_map(|output| match &output.owner {
+                SpkOwner::SilentPayment(sp) => Some(sp.as_ref()),
+                _ => None,
+            })
+    }
+
+    pub fn has_silent_payment_outputs(&self) -> bool {
+        self.silent_payment_outputs().next().is_some()
+    }
+
+    /// The distinct scan keys of the silent payment outputs, in order of first appearance.
+    pub fn silent_payment_scan_keys(&self) -> Vec<Point> {
+        let mut seen = BTreeSet::new();
+        self.silent_payment_outputs()
+            .map(|sp| sp.recipient.scan_key)
+            .filter(|scan_key| seen.insert(*scan_key))
+            .collect()
+    }
+
+    /// The BIP352 `input_hash` and the tweak context of every input, for silent payment ECDH
+    /// under `master_appkey`. `None` unless every input is a coin of that key in the default
+    /// account, since the combined ECDH is only defined over one account's input secrets.
+    pub fn sp_ecdh_inputs(
+        &self,
+        master_appkey: MasterAppkey,
+    ) -> Option<(Scalar<Public>, Vec<TweakContext>)> {
+        let account = BitcoinAccount::default();
+        let account_key = account.derive_account_key(&master_appkey.to_xpub());
+        let mut outpoints = Vec::new();
+        let mut tweaks = Vec::new();
+        for input in &self.inputs {
+            let owner = input.owner.local_owner()?;
+            if owner.master_appkey != master_appkey
+                || owner.bip32_path.account_keychain.account != account
+            {
+                return None;
+            }
+            outpoints.push(input.outpoint);
+            tweaks.push(owner.bip32_path.tweak_context(&account_key));
+        }
+        let smallest = silent_payments::smallest_outpoint(&outpoints)?;
+        let a_sum = silent_payments::a_sum_public(*account_key.key(), &tweaks)?;
+        Some((silent_payments::input_hash(&smallest, a_sum)?, tweaks))
+    }
+
+    /// The shared secret of each scan key, from threshold shares of the ECDH.
+    pub fn sp_shared_secrets(
+        &self,
+        master_appkey: MasterAppkey,
+        shares: &[EcdhShare],
+    ) -> Option<BTreeMap<Point, Point>> {
+        let (input_hash, tweaks) = self.sp_ecdh_inputs(master_appkey)?;
+        let mut by_scan_key = BTreeMap::<Point, Vec<(ShareIndex, Point)>>::new();
+        for share in shares {
+            by_scan_key
+                .entry(share.scan_key)
+                .or_default()
+                .push((share.share_index, share.ecdh_share));
+        }
+        by_scan_key
+            .into_iter()
+            .map(|(scan_key, shares)| {
+                let secret = combine_ecdh_shares(input_hash, scan_key, &tweaks, &shares)?;
+                Some((scan_key, secret))
+            })
+            .collect()
+    }
+
+    /// This template with every silent payment output's script derived from `shared_secrets`.
+    pub fn with_sp_scripts(&self, shared_secrets: &BTreeMap<Point, Point>) -> Option<Self> {
+        let recipients = self
+            .silent_payment_outputs()
+            .map(|sp| sp.recipient)
+            .collect::<Vec<_>>();
+        let mut keys = output_keys(&recipients, shared_secrets)?.into_iter();
+
+        let mut template = self.clone();
+        for output in &mut template.outputs {
+            if let SpkOwner::SilentPayment(sp) = &mut output.owner {
+                let key = XOnlyPublicKey::from_slice(&keys.next()?).ok()?;
+                sp.script = Some(ScriptBuf::new_p2tr_tweaked(
+                    TweakedPublicKey::dangerous_assume_tweaked(key),
+                ));
+            }
+        }
+        Some(template)
+    }
+
     pub fn feerate(&self) -> Option<f64> {
         let mut tx = self.to_rust_bitcoin_tx();
 
@@ -313,11 +433,23 @@ impl TransactionTemplate {
             })
             .collect::<Vec<_>>();
 
+        let silent_payment_recipients = self
+            .outputs
+            .iter()
+            .filter_map(|output| match &output.owner {
+                SpkOwner::SilentPayment(sp) => {
+                    Some((sp.address.clone(), bitcoin::Amount::from_sat(output.value)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
         // Calculate fee rate in sats/vB
         let fee_rate_sats_per_vbyte = self.feerate();
 
         PromptSignBitcoinTx {
             foreign_recipients,
+            silent_payment_recipients,
             fee,
             fee_rate_sats_per_vbyte,
         }
@@ -327,17 +459,25 @@ impl TransactionTemplate {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PromptSignBitcoinTx {
     pub foreign_recipients: Vec<(bitcoin::Address, bitcoin::Amount)>,
+    /// Silent payment recipients, as the address the recipient gave. The device has checked it
+    /// against the keys the output is paid to.
+    pub silent_payment_recipients: Vec<(String, bitcoin::Amount)>,
     pub fee: bitcoin::Amount,
     /// Fee rate in sats/vB
     pub fee_rate_sats_per_vbyte: Option<f64>,
 }
 
 impl PromptSignBitcoinTx {
-    /// Calculate the total amount being sent to foreign recipients
+    /// Calculate the total amount being sent to foreign and silent payment recipients
     pub fn total_sent(&self) -> bitcoin::Amount {
         self.foreign_recipients
             .iter()
             .map(|(_, amount)| *amount)
+            .chain(
+                self.silent_payment_recipients
+                    .iter()
+                    .map(|(_, amount)| *amount),
+            )
             .sum()
     }
 }
@@ -439,6 +579,19 @@ impl Output {
 pub enum SpkOwner {
     Foreign(#[bincode(with_serde)] ScriptBuf),
     Local(LocalSpk),
+    SilentPayment(Box<SilentPaymentOutput>),
+}
+
+/// A silent payment output. Its script depends on the ECDH shares of the signing devices, so it
+/// is `None` until they are combined. A send with any output still missing its script cannot be
+/// signed.
+#[derive(bincode::Encode, bincode::Decode, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SilentPaymentOutput {
+    pub recipient: SilentPaymentRecipient,
+    /// The address the recipient gave, for display. Must encode `recipient` on the signing network.
+    pub address: String,
+    #[bincode(with_serde)]
+    pub script: Option<ScriptBuf>,
 }
 
 impl SpkOwner {
@@ -446,25 +599,28 @@ impl SpkOwner {
         match self {
             SpkOwner::Foreign(spk) => RootOwner::Foreign(spk.clone()),
             SpkOwner::Local(local) => RootOwner::Local(local.master_appkey),
+            SpkOwner::SilentPayment(_) => RootOwner::Foreign(self.spk()),
         }
     }
     pub fn spk(&self) -> ScriptBuf {
         match self {
             SpkOwner::Foreign(spk) => spk.clone(),
             SpkOwner::Local(owner) => owner.spk(),
+            // SignTask::check refuses a send whose silent payment scripts are missing.
+            SpkOwner::SilentPayment(sp) => sp.script.clone().unwrap_or_default(),
         }
     }
 
     pub fn local_owner_key(&self) -> Option<MasterAppkey> {
         match self {
-            SpkOwner::Foreign(_) => None,
+            SpkOwner::Foreign(_) | SpkOwner::SilentPayment(_) => None,
             SpkOwner::Local(owner) => Some(owner.master_appkey),
         }
     }
 
     pub fn local_owner(&self) -> Option<&LocalSpk> {
         match self {
-            SpkOwner::Foreign(_) => None,
+            SpkOwner::Foreign(_) | SpkOwner::SilentPayment(_) => None,
             SpkOwner::Local(owner) => Some(owner),
         }
     }

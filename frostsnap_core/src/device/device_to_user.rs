@@ -23,4 +23,7 @@ pub enum DeviceToUserMessage {
     },
     Restoration(Box<restoration::ToUserRestoration>),
     NonceJobs(NonceJobBatch),
+    SpEcdhRequest {
+        phase: Box<SpEcdhPhase>,
+    },
 }

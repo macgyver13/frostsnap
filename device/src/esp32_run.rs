@@ -708,6 +708,9 @@ impl<'a> DeviceLoop<'a> {
                         DeviceToUserMessage::NonceJobs(batch) => {
                             self.nonce_task_batch = Some(batch);
                         }
+                        DeviceToUserMessage::SpEcdhRequest { phase: _ } => {
+                            // TODO: confirm silent payment ECDH requests on the device.
+                        }
                     };
                 }
             }

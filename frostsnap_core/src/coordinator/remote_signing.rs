@@ -561,6 +561,7 @@ impl FrostCoordinator {
 
         Ok(RequestDeviceSign {
             device_id,
+            sp_proofs: None,
             request_sign: RequestSign {
                 group_sign_req: group_request,
                 device_sign_req: DeviceSignReq {
