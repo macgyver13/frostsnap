@@ -18,6 +18,7 @@ tracing = { workspace = true, features = ["std"] }
 bincode.workspace = true
 rqrr = "0.10.0"
 bitcoin.workspace = true
+toml = "0.8"
 image = "0.25"
 ur = { git = "https://github.com/nickfarrow/ur-rs", rev = "2e267e5e019b6c8129f66efba00327ff3d0ae5a4" }
 rusqlite = "0.31.0"

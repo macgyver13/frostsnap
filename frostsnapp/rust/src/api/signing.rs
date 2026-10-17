@@ -250,6 +250,13 @@ impl UnsignedTx {
     }
 
     #[frb(sync)]
+    pub fn check_code(&self, network: BitcoinNetwork) -> String {
+        frostsnap_core::bitcoin_transaction::fingerprint_code(
+            &self.template_tx.outputs_fingerprint(network),
+        )
+    }
+
+    #[frb(sync)]
     pub fn details(&self, super_wallet: &SuperWallet, master_appkey: MasterAppkey) -> Transaction {
         let super_wallet = super_wallet.inner.lock().unwrap();
         let raw_tx = self.template_tx.to_rust_bitcoin_tx();
