@@ -1751,14 +1751,16 @@ class _ChatPageBodyState extends State<ChatPageBody> {
 
     try {
       if (pendingTx != null) {
+        // Build the sign task first: sendSignRequest moves unsignedTx
+        // into Rust, after which the Dart handle can no longer be read.
+        final signTask = wireSignTaskBitcoinTransaction(
+          unsignedTx: pendingTx.unsignedTx,
+        );
         final requestId = await _handle!.sendSignRequest(
           unsignedTx: pendingTx.unsignedTx,
           message: content,
         );
         if (pendingTx.devices.isNotEmpty) {
-          final signTask = wireSignTaskBitcoinTransaction(
-            unsignedTx: pendingTx.unsignedTx,
-          );
           await _sendOfferForRequest(
             requestId,
             pendingTx.asRef,
