@@ -26,6 +26,12 @@ use frostsnap_fonts::{
 };
 use tinybmp::Bmp;
 
+mod recipient_list;
+mod summary;
+
+use recipient_list::{RecipientItem, RecipientListPage};
+use summary::SummaryPage;
+
 const FONT_PAGE_HEADER: &Gray4Font = &NOTO_SANS_18_LIGHT;
 const FONT_CONFIRM_TITLE: &Gray4Font = &NOTO_SANS_18_MEDIUM;
 const FONT_CONFIRM_TEXT: &Gray4Font = &NOTO_SANS_17_REGULAR;
@@ -35,6 +41,9 @@ const FONT_CAUTION_TEXT: &Gray4Font = &NOTO_SANS_17_REGULAR;
 const FONT_SILENT_PAYMENT_ADDRESS: &Gray4Font = &NOTO_SANS_MONO_15_REGULAR;
 const SP_ADDRESS_HORIZONTAL_SPACING: u32 = 15;
 
+/// Default number of recipients above which the review switches to a list.
+pub const DEFAULT_LIST_REVIEW_THRESHOLD: usize = 3;
+
 const HIGH_FEE_ABSOLUTE_THRESHOLD_SATS: u64 = 100_000;
 const HIGH_FEE_PERCENTAGE_THRESHOLD: u64 = 5;
 const HOLD_TO_SIGN_TIME_MS: u32 = 3000;
@@ -43,6 +52,7 @@ const HOLD_TO_SIGN_TIME_MS: u32 = 3000;
 #[derive(Clone)]
 pub struct SignPromptPageList {
     prompt: PromptSignBitcoinTx,
+    list_threshold: usize,
     total_pages: usize,
     rand_seed: u32,
 }
@@ -372,18 +382,24 @@ type SignPromptPage = AnyOf<(
     FeePage,
     WarningPage,
     ConfirmationPage,
+    SummaryPage,
+    RecipientListPage,
 )>;
 
 impl SignPromptPageList {
-    fn new_with_seed(prompt: PromptSignBitcoinTx, rand_seed: u32) -> Self {
+    fn new_with_seed(prompt: PromptSignBitcoinTx, rand_seed: u32, list_threshold: usize) -> Self {
         let num_recipients =
             prompt.foreign_recipients.len() + prompt.silent_payment_recipients.len();
         let has_warning = Self::has_high_fee(&prompt);
 
-        let total_pages = num_recipients * 2 + 1 + if has_warning { 1 } else { 0 } + 1;
-
+        let total_pages = if num_recipients > list_threshold {
+            2 + if has_warning { 1 } else { 0 } + 1
+        } else {
+            num_recipients * 2 + if has_warning { 1 } else { 0 } + 2
+        };
         Self {
             prompt,
+            list_threshold,
             total_pages,
             rand_seed,
         }
@@ -421,6 +437,44 @@ impl WidgetList for SignPromptPageList {
             self.prompt.foreign_recipients.len() + self.prompt.silent_payment_recipients.len();
         let recipient_pages = num_recipients * 2;
         let has_warning = Self::has_high_fee(&self.prompt);
+
+        if num_recipients > self.list_threshold {
+            let page = if index == 0 {
+                let summary = SummaryPage::new(
+                    num_recipients,
+                    self.prompt.total_sent().to_sat(),
+                    self.prompt.fee.to_sat(),
+                    self.prompt.fee_rate_sats_per_vbyte,
+                );
+                SignPromptPage::new(summary)
+            } else if index == 1 {
+                let mut recipients = Vec::with_capacity(num_recipients);
+                for (i, (addr, amt)) in self.prompt.foreign_recipients.iter().enumerate() {
+                    recipients.push(RecipientItem::Foreign {
+                        index: i,
+                        address: addr.clone(),
+                        amount: *amt,
+                    });
+                }
+                let foreign_len = self.prompt.foreign_recipients.len();
+                for (i, contact) in self.prompt.silent_payment_recipients.iter().enumerate() {
+                    recipients.push(RecipientItem::SilentPayment {
+                        index: foreign_len + i,
+                        name: contact.name.clone(),
+                        address: contact.address.clone(),
+                        amount: contact.amount,
+                    });
+                }
+                let list_page = RecipientListPage::new(recipients, self.rand_seed);
+                SignPromptPage::new(list_page)
+            } else if has_warning && index == 2 {
+                let total_sent = self.prompt.total_sent().to_sat();
+                SignPromptPage::new(WarningPage::new(self.prompt.fee.to_sat(), total_sent))
+            } else {
+                SignPromptPage::new(ConfirmationPage::new())
+            };
+            return Some(WidgetListItem::new(page));
+        }
 
         let (page, use_fb) = if index < recipient_pages {
             let recipient_idx = index / 2;
@@ -504,10 +558,22 @@ impl WidgetList for SignPromptPageList {
                 return !confirmation_page.is_confirmed();
             }
         }
+        if let Some(list_page) = current_widget.downcast_ref::<RecipientListPage>() {
+            return list_page.can_go_prev();
+        }
+        true
+    }
+
+    fn can_go_next(&self, from_index: usize, current_widget: &SignPromptPage) -> bool {
+        if from_index + 1 >= self.total_pages {
+            return false;
+        }
+        if let Some(list_page) = current_widget.downcast_ref::<RecipientListPage>() {
+            return list_page.can_go_next();
+        }
         true
     }
 }
-
 /// High-level widget that manages the complete sign prompt flow using PageSlider
 #[derive(frostsnap_macros::Widget)]
 pub struct SignTxPrompt {
@@ -521,7 +587,18 @@ impl SignTxPrompt {
     }
 
     pub fn new_with_seed(prompt: PromptSignBitcoinTx, rand_seed: u32) -> Self {
-        let page_list = SignPromptPageList::new_with_seed(prompt, rand_seed);
+        Self::new_with_seed_and_threshold(prompt, rand_seed, DEFAULT_LIST_REVIEW_THRESHOLD)
+    }
+
+    /// `list_threshold` is the number of recipients above which the review is a summary page and
+    /// a list of recipients instead of one page per recipient. 0 always uses the list, 1 uses it
+    /// when there is more than one recipient.
+    pub fn new_with_seed_and_threshold(
+        prompt: PromptSignBitcoinTx,
+        rand_seed: u32,
+        list_threshold: usize,
+    ) -> Self {
+        let page_list = SignPromptPageList::new_with_seed(prompt, rand_seed, list_threshold);
         let mut page_slider = Box::new(PageSlider::new(page_list));
         page_slider.set_on_page_ready(|page| {
             if let Some(confirmation_page) = page.downcast_mut::<ConfirmationPage>() {
@@ -655,5 +732,48 @@ mod test {
             let title = contact_title(format!("{prefix} {name}"));
             assert!(title.sizing().width <= 240);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use frostsnap_core::bitcoin_transaction::PromptContact;
+
+    fn prompt(num_sp_recipients: usize) -> PromptSignBitcoinTx {
+        PromptSignBitcoinTx {
+            foreign_recipients: vec![],
+            silent_payment_recipients: (0..num_sp_recipients)
+                .map(|i| PromptContact {
+                    name: format!("Contact {i}"),
+                    address: format!("tsp1recipient{i}"),
+                    amount: bitcoin::Amount::from_sat(1_000),
+                })
+                .collect(),
+            fee: bitcoin::Amount::from_sat(10),
+            fee_rate_sats_per_vbyte: Some(1.0),
+        }
+    }
+
+    fn pages(num_recipients: usize, list_threshold: usize) -> usize {
+        SignPromptPageList::new_with_seed(prompt(num_recipients), 0, list_threshold).len()
+    }
+
+    #[test]
+    fn list_review_starts_above_the_threshold() {
+        // Summary, list, confirm.
+        const LIST: usize = 3;
+        // Two pages per recipient, then fee and confirm.
+        let per_recipient = |n: usize| n * 2 + 2;
+
+        // Threshold 0 always uses the list, even for one recipient.
+        assert_eq!(pages(1, 0), LIST);
+        // Threshold 1 uses the list from two recipients.
+        assert_eq!(pages(1, 1), per_recipient(1));
+        assert_eq!(pages(2, 1), LIST);
+        // The default keeps one page per recipient up to three.
+        assert_eq!(pages(3, DEFAULT_LIST_REVIEW_THRESHOLD), per_recipient(3));
+        assert_eq!(pages(4, DEFAULT_LIST_REVIEW_THRESHOLD), LIST);
     }
 }

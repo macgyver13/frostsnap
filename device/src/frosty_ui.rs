@@ -20,6 +20,10 @@ use crate::{
     UpstreamConnectionState,
 };
 
+/// Recipients above which signing review uses a summary and list instead of one page per
+/// recipient. 0 always uses the list.
+const REVIEW_LIST_THRESHOLD: usize = frostsnap_widgets::DEFAULT_LIST_REVIEW_THRESHOLD;
+
 // Type alias for the display to match factory
 type DeviceDisplay<'a> = mipidsi::Display<
     display_interface_spi::SPIInterface<
@@ -228,8 +232,11 @@ impl<'a> UserInteraction for FrostyUi<'a> {
                                 let prompt = tx_template.user_prompt(*network);
 
                                 // Create the SignTxPrompt widget with random seed
-                                let widget =
-                                    Box::new(SignTxPrompt::new_with_seed(prompt, rand_seed));
+                                let widget = Box::new(SignTxPrompt::new_with_seed_and_threshold(
+                                    prompt,
+                                    rand_seed,
+                                    REVIEW_LIST_THRESHOLD,
+                                ));
 
                                 // Store both widget and phase in the WidgetTree
                                 WidgetTree::SignTxPrompt {
