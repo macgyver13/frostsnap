@@ -1,15 +1,26 @@
-//! Checks on silent payment sends: the template must spend this wallet's own inputs, and each
-//! silent payment address must be the one for the keys it pays.
+//! Silent payment sends from a threshold wallet: the checks a template must pass, the ECDH round
+//! that derives the silent payment scripts, and the rejections of a tampered ECDH request.
 
 use bitcoin::{hashes::Hash, Amount, Network, OutPoint, Txid};
 use frostsnap_core::{
     bitcoin_transaction::{LocalSpk, PromptDestination, PushInput, TransactionTemplate},
     device::KeyPurpose,
+    message::{
+        signing::{CoordinatorSigning, DeviceSigning},
+        CoordinatorToDeviceMessage, DeviceToCoordinatorMessage,
+    },
     silent_payments::SilentPaymentRecipient,
     tweak::{BitcoinBip32Path, NormalIndex},
-    MasterAppkey, SignTaskError, WireSignTask,
+    AccessStructureRef, MasterAppkey, SignTaskError, WireSignTask,
 };
+use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use schnorr_fun::fun::{g, marker::*, Point, Scalar, G};
+use std::collections::BTreeSet;
+
+mod common;
+mod env;
+use crate::common::{Run, Send, TEST_ENCRYPTION_KEY};
+use crate::env::TestEnv;
 
 const NETWORK: Network = Network::Bitcoin;
 
@@ -169,4 +180,133 @@ fn prompt_shows_the_silent_payment_address_and_hides_single_change() {
     );
     assert_eq!(prompt.recipients[0].amount, Amount::from_sat(50_000));
     assert_eq!(prompt.recipients[0].owned, None);
+}
+
+/// A 2-of-3 bitcoin wallet with its nonces ready, and the coordinator's view of its key.
+struct Wallet {
+    run: Run,
+    env: TestEnv,
+    rng: ChaCha20Rng,
+    access_structure_ref: AccessStructureRef,
+    master_appkey: MasterAppkey,
+}
+
+fn wallet(seed: u8) -> Wallet {
+    let mut rng = ChaCha20Rng::from_seed([seed; 32]);
+    let mut env = TestEnv::default();
+    let run = Run::start_after_keygen_and_nonces(3, 2, &mut env, &mut rng, 1, purpose());
+    let access_structure_ref = run
+        .coordinator
+        .iter_access_structures()
+        .next()
+        .unwrap()
+        .access_structure_ref();
+    let master_appkey = run
+        .coordinator
+        .get_frost_key(access_structure_ref.key_id)
+        .unwrap()
+        .complete_key
+        .master_appkey;
+    Wallet {
+        run,
+        env,
+        rng,
+        access_structure_ref,
+        master_appkey,
+    }
+}
+
+/// Starts an ECDH round for a send of one silent payment to `recipient`, asking the first two
+/// devices, which is a threshold.
+fn start_ecdh(wallet: &mut Wallet, recipient: (SilentPaymentRecipient, String)) {
+    let mut template = TransactionTemplate::new();
+    owned_input(&mut template, wallet.master_appkey, 100_000);
+    template.push_silent_payment_output(Amount::from_sat(50_000), recipient.0, recipient.1);
+    let devices: BTreeSet<_> = wallet.run.device_vec().into_iter().take(2).collect();
+
+    let (_, sends) = wallet
+        .run
+        .coordinator
+        .start_sp_ecdh(
+            wallet.access_structure_ref,
+            WireSignTask::BitcoinTransaction(template),
+            &devices,
+            TEST_ENCRYPTION_KEY,
+            &mut wallet.rng,
+        )
+        .unwrap();
+    wallet.run.extend(sends);
+}
+
+#[test]
+fn silent_payment_ecdh_round_with_a_threshold_completes() {
+    let mut wallet = wallet(21);
+    start_ecdh(&mut wallet, recipient(0x91, 0x92));
+    wallet
+        .run
+        .run_until_finished(&mut wallet.env, &mut wallet.rng)
+        .unwrap();
+}
+
+#[test]
+fn device_refuses_an_ecdh_request_for_other_scan_keys() {
+    let mut wallet = wallet(23);
+    start_ecdh(&mut wallet, recipient(0xa1, 0xa2));
+
+    let result =
+        wallet
+            .run
+            .run_until(&mut wallet.env, &mut wallet.rng, |run| {
+                for send in run.message_queue.iter_mut() {
+                    if let Send::CoordinatorToDevice {
+                        message:
+                            CoordinatorToDeviceMessage::Signing(CoordinatorSigning::RequestSpEcdh(
+                                request,
+                            )),
+                        ..
+                    } = send
+                    {
+                        request.scan_keys.push(public(scalar(0xa3)));
+                    }
+                }
+                run.message_queue.is_empty()
+            });
+    let error = result.expect_err("the device must refuse the tampered request");
+    assert!(
+        error
+            .to_string()
+            .contains("silent payment ECDH request does not match its transaction"),
+        "refused for the wrong reason: {error}"
+    );
+}
+
+#[test]
+fn coordinator_refuses_a_device_with_a_bad_proof() {
+    let mut wallet = wallet(11);
+    start_ecdh(&mut wallet, recipient(0x41, 0x42));
+
+    let result = wallet
+        .run
+        .run_until(&mut wallet.env, &mut wallet.rng, |run| {
+            for send in run.message_queue.iter_mut() {
+                if let Send::DeviceToCoordinator {
+                    message:
+                        DeviceToCoordinatorMessage::Signing(DeviceSigning::SpEcdhShares {
+                            shares, ..
+                        }),
+                    ..
+                } = send
+                {
+                    shares[0].proof = [0u8; 64];
+                }
+            }
+            run.message_queue.is_empty()
+        });
+    let error = result.expect_err("the coordinator must refuse the bad proof");
+    assert!(
+        error
+            .to_string()
+            .contains("silent payment ECDH share has a bad proof"),
+        "refused for the wrong reason: {error}"
+    );
 }

@@ -4,13 +4,15 @@ mod common;
 use frostsnap_core::coordinator::{
     keys::KeyMutation,
     restoration::{PendingConsolidation, RestorationMutation},
-    signing::SigningMutation,
+    signing::{SigningMutation, SpEcdhSession},
     ActiveSignSession, CompleteKey, CoordAccessStructure, Mutation, SignSessionProgress, StartSign,
 };
 use frostsnap_core::device::KeyPurpose;
+use frostsnap_core::message::signing::SpEcdhSessionId;
 use frostsnap_core::message::HeldShare2;
 use frostsnap_core::message::{EncodedSignature, GroupSignReq};
 use frostsnap_core::nonce_stream::{CoordNonceStreamState, NonceStreamId, NonceStreamSegment};
+use frostsnap_core::silent_payments::EcdhShare;
 use frostsnap_core::tweak::AppTweak;
 use frostsnap_core::tweak::Xpub;
 use frostsnap_core::{
@@ -195,6 +197,14 @@ fn test_all_coordinator_mutations() {
     // Create SignatureShare - it's just a Scalar<Public, Zero>
     let signature_shares = vec![s!(15).public().mark_zero()];
 
+    let sp_point = g!(7 * G).normalize().non_zero().unwrap();
+    let ecdh_share = EcdhShare {
+        scan_key: sp_point,
+        share_index: s!(1).public(),
+        ecdh_share: g!(9 * G).normalize().non_zero().unwrap(),
+        proof: [16u8; 64],
+    };
+
     // Create EncodedSignature
     let encoded_sig = EncodedSignature([14u8; 64]);
 
@@ -299,6 +309,24 @@ fn test_all_coordinator_mutations() {
         }),
         Mutation::Signing(SigningMutation::ForgetFinishedSignSession {
             session_id: SignSessionId([12u8; 32]),
+        }),
+        // Silent payment ECDH mutations
+        Mutation::Signing(SigningMutation::NewSpEcdhSession(SpEcdhSession {
+            session_id: SpEcdhSessionId([17u8; 32]),
+            access_structure_ref,
+            sign_task: WireSignTask::Test {
+                message: "sp".into(),
+            },
+            requested: BTreeSet::from([DeviceId([5u8; 33])]),
+            shares: BTreeMap::new(),
+        })),
+        Mutation::Signing(SigningMutation::GotSpEcdhShares {
+            session_id: SpEcdhSessionId([17u8; 32]),
+            device_id: DeviceId([5u8; 33]),
+            shares: vec![ecdh_share],
+        }),
+        Mutation::Signing(SigningMutation::CloseSpEcdhSession {
+            session_id: SpEcdhSessionId([17u8; 32]),
         }),
     ];
 
@@ -414,6 +442,24 @@ fn test_all_coordinator_mutations() {
                 assert_bincode_hex_eq!(
                     mutation,
                     "01050c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+                );
+            }
+            Mutation::Signing(SigningMutation::NewSpEcdhSession(_)) => {
+                assert_bincode_hex_eq!(
+                    mutation,
+                    "0106111111111111111111111111111111111111111111111111111111111111111103030303030303030303030303030303030303030303030303030303030303030404040404040404040404040404040404040404040404040404040404040404000273700105050505050505050505050505050505050505050505050505050505050505050500"
+                );
+            }
+            Mutation::Signing(SigningMutation::GotSpEcdhShares { .. }) => {
+                assert_bincode_hex_eq!(
+                    mutation,
+                    "0107111111111111111111111111111111111111111111111111111111111111111105050505050505050505050505050505050505050505050505050505050505050501025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc000000000000000000000000000000000000000000000000000000000000000103acd484e2f0c7f65309ad178a9f559abde09796974c57e714c35f110dfc27ccbe10101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010"
+                );
+            }
+            Mutation::Signing(SigningMutation::CloseSpEcdhSession { .. }) => {
+                assert_bincode_hex_eq!(
+                    mutation,
+                    "01081111111111111111111111111111111111111111111111111111111111111111"
                 );
             }
             Mutation::Restoration(RestorationMutation::NewRestoration2 { .. }) => {

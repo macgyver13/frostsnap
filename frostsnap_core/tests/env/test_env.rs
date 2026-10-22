@@ -120,6 +120,7 @@ impl Env for TestEnv {
                             .map(Option::unwrap),
                     );
                 }
+                CoordinatorToUserSigningMessage::GotSpEcdhShares { .. } => {}
             },
             CoordinatorToUserMessage::Restoration(msg) => {
                 use frostsnap_core::coordinator::restoration::ToUserRestoration::*;
@@ -229,6 +230,13 @@ impl Env for TestEnv {
                     .sign_ack(*phase, &mut TestDeviceKeyGen)
                     .unwrap();
                 run.extend_from_device(from, sign_ack);
+            }
+            DeviceToUserMessage::SpEcdhRequest { phase } => {
+                let ack = run
+                    .device(from)
+                    .sp_ecdh_ack(*phase, &mut TestDeviceKeyGen, rng)
+                    .unwrap();
+                run.extend_from_device(from, ack);
             }
             DeviceToUserMessage::Restoration(restoration) => {
                 use device::restoration::ToUserRestoration::*;
