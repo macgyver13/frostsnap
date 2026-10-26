@@ -60,6 +60,9 @@ pub struct SignPromptPageList {
     total_pages: usize,
     rand_seed: u32,
     kind: SignPromptKind,
+    /// False when the device already reviewed this send, at the silent payment ECDH: only the hold
+    /// page is shown.
+    review: bool,
 }
 
 /// Page widget for displaying amount to send
@@ -504,6 +507,7 @@ impl SignPromptPageList {
             total_pages,
             rand_seed,
             kind,
+            review: true,
         }
     }
 
@@ -529,6 +533,11 @@ impl WidgetList for SignPromptPageList {
     fn get(&self, index: usize) -> Option<WidgetListItem<SignPromptPage>> {
         if index >= self.total_pages {
             return None;
+        }
+        if !self.review {
+            return Some(WidgetListItem::new(SignPromptPage::new(
+                ConfirmationPage::new(self.kind, &self.prompt.fingerprint_code()),
+            )));
         }
 
         let num_recipients = self.prompt.recipients.len();
@@ -648,8 +657,21 @@ impl SignTxPrompt {
         Self::new_with_kind(prompt, rand_seed, SignPromptKind::SpEcdh)
     }
 
+    /// Signing a send this device already reviewed when it contributed its ECDH shares: only the
+    /// hold page, with the check code, so the user holds once more to sign without a second review.
+    pub fn new_approved(prompt: PromptSignBitcoinTx, rand_seed: u32) -> Self {
+        let mut page_list =
+            SignPromptPageList::new_with_seed(prompt, rand_seed, SignPromptKind::Sign);
+        page_list.review = false;
+        page_list.total_pages = 1;
+        Self::from_page_list(page_list)
+    }
+
     fn new_with_kind(prompt: PromptSignBitcoinTx, rand_seed: u32, kind: SignPromptKind) -> Self {
-        let page_list = SignPromptPageList::new_with_seed(prompt, rand_seed, kind);
+        Self::from_page_list(SignPromptPageList::new_with_seed(prompt, rand_seed, kind))
+    }
+
+    fn from_page_list(page_list: SignPromptPageList) -> Self {
         let mut page_slider = Box::new(PageSlider::new(page_list));
         page_slider.set_on_page_ready(|page| {
             if let Some(confirmation_page) = page.downcast_mut::<ConfirmationPage>() {

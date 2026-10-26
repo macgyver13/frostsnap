@@ -144,7 +144,12 @@ impl WidgetTree {
                 network,
             } => {
                 let prompt = tx_template.user_prompt(*network);
-                let widget = Box::new(SignTxPrompt::new_with_seed(prompt, rand_seed));
+                // Reviewed on this device at the silent payment ECDH: only the hold is left.
+                let widget = Box::new(if phase.approved_during_ecdh() {
+                    SignTxPrompt::new_approved(prompt, rand_seed)
+                } else {
+                    SignTxPrompt::new_with_seed(prompt, rand_seed)
+                });
                 Self::SignTxPrompt {
                     widget,
                     phase: Some(phase),

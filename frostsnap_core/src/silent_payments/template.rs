@@ -13,8 +13,9 @@ use bitcoin::{
 };
 use schnorr_fun::{
     frost::ShareIndex,
-    fun::{marker::*, Point, Scalar},
+    fun::{hash::Tag, marker::*, Point, Scalar},
 };
+use sha2::{Digest, Sha256};
 
 use super::{
     a_sum_public, combine_ecdh_shares, input_hash, output_keys, smallest_outpoint, EcdhShare,
@@ -70,6 +71,36 @@ impl<S: Clone> TransactionTemplate<S> {
             .map(|sp| sp.recipient.scan_key)
             .filter(|scan_key| seen.insert(*scan_key))
             .collect()
+    }
+
+    /// What a device approves when it contributes its ECDH shares: everything about the send but
+    /// the silent payment scripts, which the ECDH is about to derive. The transaction with those
+    /// scripts cleared covers the inputs, the other outputs, the version and the lock time; the
+    /// input values cover the fee; the outputs fingerprint covers every address, the silent
+    /// payment ones included. A sign request whose template has the same digest is the send the
+    /// device already reviewed.
+    pub fn sp_approval_digest(&self, network: bitcoin::Network) -> [u8; 32] {
+        use bitcoin::consensus::Encodable;
+        let mut without_scripts = self.clone();
+        for output in &mut without_scripts.outputs {
+            if let SpkOwner::SilentPayment(sp) = &mut output.owner {
+                sp.script = None;
+            }
+        }
+        let mut tx_bytes = Vec::new();
+        without_scripts
+            .to_rust_bitcoin_tx()
+            .consensus_encode(&mut tx_bytes)
+            .expect("writing to a vec cannot fail");
+
+        let mut hash = Sha256::default().tag(b"frostsnap/sp-approval/v1");
+        hash.update((tx_bytes.len() as u64).to_le_bytes());
+        hash.update(&tx_bytes);
+        for input in self.inputs() {
+            hash.update(input.txout().value.to_sat().to_le_bytes());
+        }
+        hash.update(self.outputs_fingerprint(network));
+        hash.finalize().into()
     }
 
     /// This template with every silent payment output's script derived from `shared_secrets`.

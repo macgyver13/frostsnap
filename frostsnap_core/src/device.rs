@@ -67,6 +67,10 @@ pub struct FrostSigner<S = MemoryNonceSlot> {
     restoration: restoration::State,
     pub keygen_fingerprint: Fingerprint,
     pub nonce_batch_size: u32,
+    /// The silent payment send the user last approved with "Hold to Contribute", by
+    /// [`TransactionTemplate::sp_approval_digest`]. In memory only: a restart, a cancel or a newer
+    /// approval forgets it, and the sign request it matches uses it up.
+    sp_approval: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -171,9 +175,16 @@ pub struct SignPhase1 {
     device_sign_req: DeviceSignReq,
     encrypted_secret_share: EncryptedSecretShare,
     pub session_id: SignSessionId,
+    approved_during_ecdh: bool,
 }
 
 impl SignPhase1 {
+    /// The user already reviewed this send on this device when it contributed its ECDH shares,
+    /// so the prompt can skip straight to the hold.
+    pub fn approved_during_ecdh(&self) -> bool {
+        self.approved_during_ecdh
+    }
+
     pub fn sign_task(&self) -> &CheckedSignTask {
         &self.group_sign_req.sign_task
     }
@@ -274,6 +285,7 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
             restoration: Default::default(),
             keygen_fingerprint: Fingerprint::FROST_V0,
             nonce_batch_size: NONCE_BATCH_SIZE,
+            sp_approval: None,
         }
     }
 
@@ -363,6 +375,7 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
     pub fn clear_tmp_data(&mut self) {
         self.clear_unfinished_keygens();
         self.restoration.clear_tmp_data();
+        self.sp_approval = None;
     }
 
     pub fn keypair(&self) -> &KeyPair {
@@ -531,11 +544,26 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
         .map_err(|reason| Error::signer_invalid_message(message, reason))?;
 
         // Removed are_nonces_available check - let the signing system handle it
+        // Only a send with silent payment outputs has an ECDH step to have approved it at, and the
+        // approval is used up here so it covers one sign request.
+        let approved_during_ecdh = sp_proofs.is_some()
+            && match &group_sign_req.sign_task.inner {
+                SignTask::BitcoinTransaction {
+                    tx_template,
+                    network,
+                } => self.sp_approval == Some(tx_template.sp_approval_digest(*network)),
+                _ => false,
+            };
+        if approved_during_ecdh {
+            self.sp_approval = None;
+        }
+
         let phase = SignPhase1 {
             group_sign_req,
             device_sign_req,
             encrypted_secret_share,
             session_id,
+            approved_during_ecdh,
         };
         Ok(vec![DeviceSend::ToUser(Box::new(
             DeviceToUserMessage::SignatureRequest {
@@ -656,7 +684,7 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
     /// Confirms a silent payment ECDH request. Answers with this device's account key share's
     /// ECDH share for every scan key of the transaction, each with a proof.
     pub fn sp_ecdh_ack(
-        &self,
+        &mut self,
         phase: SpEcdhPhase,
         symm_keygen: &mut impl DeviceSecretDerivation,
         rng: &mut impl rand_core::RngCore,
@@ -669,7 +697,11 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
             encrypted_secret_share,
             sign_task,
         } = phase;
-        let SignTask::BitcoinTransaction { tx_template, .. } = &sign_task.inner else {
+        let SignTask::BitcoinTransaction {
+            tx_template,
+            network,
+        } = &sign_task.inner
+        else {
             return Err(ActionError::StateInconsistent(
                 "silent payment ECDH for a task that is not a bitcoin transaction".into(),
             ));
@@ -722,6 +754,9 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
             shares.push(share);
         }
 
+        // The user held "Hold to Contribute" after reviewing this send.
+        self.sp_approval = Some(tx_template.sp_approval_digest(*network));
+
         Ok(vec![DeviceSend::ToCoordinator(Box::new(
             DeviceToCoordinatorMessage::Signing(signing::DeviceSigning::SpEcdhShares {
                 session_id,
@@ -751,6 +786,7 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
                 },
             encrypted_secret_share,
             session_id,
+            approved_during_ecdh: _,
         } = phase;
 
         let sign_items = sign_task.sign_items();

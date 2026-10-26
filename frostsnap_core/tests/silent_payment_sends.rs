@@ -439,6 +439,37 @@ fn local_ecdh_refuses_to_open_signing_before_a_threshold_has_answered() {
     );
 }
 
+/// A round left over from an earlier run of the app, or one for a deleted key, is dropped with the
+/// shares it collected.
+#[test]
+fn leftover_and_deleted_key_ecdh_rounds_are_dropped() {
+    let mut wallet = wallet(37);
+    let leftover = approve(&mut wallet, recipient(0x37, 0x38));
+    wallet.run.coordinator.cancel_all_sp_ecdh();
+    let result = wallet
+        .run
+        .coordinator
+        .start_sign_sp(leftover, &mut wallet.rng);
+    assert!(
+        matches!(result, Err(StartSignError::NoSuchSilentPaymentSession)),
+        "got {result:?}"
+    );
+
+    let of_deleted_key = approve(&mut wallet, recipient(0x39, 0x3a));
+    wallet
+        .run
+        .coordinator
+        .delete_key(wallet.access_structure_ref.key_id);
+    let result = wallet
+        .run
+        .coordinator
+        .start_sign_sp(of_deleted_key, &mut wallet.rng);
+    assert!(
+        matches!(result, Err(StartSignError::NoSuchSilentPaymentSession)),
+        "got {result:?}"
+    );
+}
+
 /// A device rederives the silent payment scripts from the proofs before it shows a sign request,
 /// so a host that swaps a script is refused.
 #[test]
@@ -498,4 +529,74 @@ fn device_refuses_a_sign_request_whose_script_does_not_match_the_proofs() {
             .contains("silent payment output scripts do not match the ECDH shares"),
         "refused for the wrong reason: {error}"
     );
+}
+
+/// Runs an ECDH round for a send to `recipient`, asking the first two devices, and lets them
+/// approve it.
+fn approve(wallet: &mut Wallet, recipient: (SilentPaymentRecipient, String)) -> SpEcdhSessionId {
+    let devices: BTreeSet<_> = wallet.run.device_vec().into_iter().take(2).collect();
+    let (ecdh_session, sends) = start_ecdh_with(wallet, recipient, &devices);
+    wallet.run.extend(sends);
+    wallet
+        .run
+        .run_until_finished(&mut wallet.env, &mut wallet.rng)
+        .unwrap();
+    ecdh_session
+}
+
+/// Opens signing from `ecdh_session`, signs it, and returns whether each signer's request came as
+/// already reviewed at the ECDH step.
+fn sign(wallet: &mut Wallet, ecdh_session: SpEcdhSessionId) -> Vec<bool> {
+    let session_id = wallet
+        .run
+        .coordinator
+        .start_sign_sp(ecdh_session, &mut wallet.rng)
+        .unwrap();
+    let signers: Vec<_> = wallet.run.device_vec().into_iter().take(2).collect();
+    for device_id in &signers {
+        let sign_req =
+            wallet
+                .run
+                .coordinator
+                .request_device_sign(session_id, *device_id, TEST_ENCRYPTION_KEY);
+        wallet.run.extend(sign_req);
+    }
+    wallet
+        .run
+        .run_until_finished(&mut wallet.env, &mut wallet.rng)
+        .unwrap();
+    signers
+        .iter()
+        .map(|device_id| wallet.env.sign_approved_during_ecdh[&(session_id, *device_id)])
+        .collect()
+}
+
+#[test]
+fn signing_the_send_a_device_approved_at_the_ecdh_needs_no_second_review() {
+    let mut wallet = wallet(41);
+    let send = approve(&mut wallet, recipient(0x41, 0x42));
+    assert_eq!(sign(&mut wallet, send), [true, true]);
+}
+
+#[test]
+fn a_newer_approval_replaces_the_older_one() {
+    let mut wallet = wallet(43);
+    let first = approve(&mut wallet, recipient(0x43, 0x44));
+    let second = approve(&mut wallet, recipient(0x45, 0x46));
+    assert_eq!(
+        sign(&mut wallet, first),
+        [false, false],
+        "the devices last approved the second send, so the first is reviewed again"
+    );
+    assert_eq!(sign(&mut wallet, second), [true, true]);
+}
+
+#[test]
+fn a_cancel_forgets_the_approval() {
+    let mut wallet = wallet(47);
+    let send = approve(&mut wallet, recipient(0x47, 0x48));
+    for device_id in wallet.run.device_vec() {
+        wallet.run.device(device_id).clear_tmp_data();
+    }
+    assert_eq!(sign(&mut wallet, send), [false, false]);
 }

@@ -37,6 +37,8 @@ pub struct TestEnv {
     // signing
     pub received_signing_shares: BTreeMap<SignSessionId, BTreeSet<DeviceId>>,
     pub sign_tasks: BTreeMap<DeviceId, CheckedSignTask>,
+    /// Whether each device's sign request came as already reviewed at the silent payment ECDH.
+    pub sign_approved_during_ecdh: BTreeMap<(SignSessionId, DeviceId), bool>,
     pub signatures: BTreeMap<SignSessionId, Vec<Signature>>,
 
     pub verification_requests: BTreeMap<DeviceId, (Address, BitcoinBip32Path)>,
@@ -225,6 +227,8 @@ impl Env for TestEnv {
             }
             DeviceToUserMessage::SignatureRequest { phase } => {
                 self.sign_tasks.insert(from, phase.sign_task().clone());
+                self.sign_approved_during_ecdh
+                    .insert((phase.session_id, from), phase.approved_during_ecdh());
                 let sign_ack = run
                     .device(from)
                     .sign_ack(*phase, &mut TestDeviceKeyGen)

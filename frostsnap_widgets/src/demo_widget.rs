@@ -530,6 +530,29 @@ macro_rules! demo_widget {
                 let widget = SignTxPrompt::new_sp_ecdh(prompt, 0);
                 $run_macro!(widget);
             }
+            "sp_approved_sign_prompt" => {
+                use $crate::sign_prompt::SignTxPrompt;
+                use frostsnap_core::bitcoin_transaction::{
+                    PromptDestination, PromptRecipient, PromptSignBitcoinTx,
+                };
+
+                // Signing a send this device already reviewed at the ECDH: only the hold page.
+                let prompt = PromptSignBitcoinTx {
+                    recipients: $crate::alloc::vec![PromptRecipient {
+                        destination: PromptDestination::SilentPayment(
+                            "tsp1qq8p30wgx9mzp9dwpv6wu3q2m43fd4x9cxkksza8c9jhvyzwj9wxc3ah2hkd3y202ac3w5rwz5e3yd5dleafsg0smehwgl9r8f2myccasq8348jm".into(),
+                        ),
+                        amount: bitcoin::Amount::from_sat(250_000),
+                        owned: None,
+                    }],
+                    fee: bitcoin::Amount::from_sat(1_500),
+                    fee_rate_sats_per_vbyte: Some(8.5),
+                    outputs_fingerprint: [0xab; 32], // placeholder for the demo
+                };
+
+                let widget = SignTxPrompt::new_approved(prompt, 0);
+                $run_macro!(widget);
+            }
             "bitcoin_amount" => {
                 use $crate::{bitcoin_amount_display::BitcoinAmountDisplay, Column, MainAxisAlignment};
 
@@ -1440,7 +1463,7 @@ macro_rules! demo_widget {
                 $run_macro!(widget);
             }
             _ => {
-                panic!("Unknown demo: '{}'. Valid demos: hello_world, bip39_entry, log_touches, numeric_keyboard, hold_confirm, welcome, column_cross_axis, column_center, row_cross_axis, row_center, row_inside_column, bip39_backup, all_words, fade_in, fade_switcher, device_name, device_name_cursor, bobbing_icon, swipe_up_chevron, keygen_check, sign_prompt, sp_ecdh_prompt, bitcoin_amount, slide_in, firmware_upgrade_progress, firmware_upgrade_download, firmware_upgrade_erase, firmware_upgrade_passive, progress, firmware_upgrade, array_column, vec_column, word_selector, address, standby, standby_recovery, screen_test, multiline_string, logo_colors, standby_transitions, erase_device, aa_compare, border_iter, check_backup", $demo);
+                panic!("Unknown demo: '{}'. Valid demos: hello_world, bip39_entry, log_touches, numeric_keyboard, hold_confirm, welcome, column_cross_axis, column_center, row_cross_axis, row_center, row_inside_column, bip39_backup, all_words, fade_in, fade_switcher, device_name, device_name_cursor, bobbing_icon, swipe_up_chevron, keygen_check, sign_prompt, sp_ecdh_prompt, sp_approved_sign_prompt, bitcoin_amount, slide_in, firmware_upgrade_progress, firmware_upgrade_download, firmware_upgrade_erase, firmware_upgrade_passive, progress, firmware_upgrade, array_column, vec_column, word_selector, address, standby, standby_recovery, screen_test, multiline_string, logo_colors, standby_transitions, erase_device, aa_compare, border_iter, check_backup", $demo);
             }
         }
     };
