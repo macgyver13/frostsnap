@@ -44,12 +44,22 @@ const HOLD_TO_SIGN_TIME_MS: u32 = 3000;
 
 const FONT_TO_SELF_FOOTNOTE: &Gray4Font = &NOTO_SANS_17_REGULAR;
 
+/// What holding the last page confirms. A silent payment send asks the devices for their ECDH
+/// shares before it is signed, and the user reviews the same outputs for both, so the two prompts
+/// differ only in what the hold does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SignPromptKind {
+    Sign,
+    SpEcdh,
+}
+
 /// Widget list that generates sign prompt pages
 #[derive(Clone)]
 pub struct SignPromptPageList {
     prompt: PromptSignBitcoinTx,
     total_pages: usize,
     rand_seed: u32,
+    kind: SignPromptKind,
 }
 
 /// Page widget for displaying amount to send
@@ -406,19 +416,28 @@ pub struct ConfirmationPage {
 
 impl ConfirmationPage {
     #[inline(never)]
-    fn new() -> Self {
+    fn new(kind: SignPromptKind) -> Self {
+        let (title, line1, line2) = match kind {
+            SignPromptKind::Sign => ("Hold to Sign", "Press and hold", "for 3 seconds"),
+            // Its own title and copy, so the user can tell the two steps apart.
+            SignPromptKind::SpEcdh => (
+                "Hold to Contribute",
+                "Adds your key share,",
+                "not signing yet",
+            ),
+        };
         let sign_text = Text::new(
-            "Hold to Sign".to_string(),
+            title.to_string(),
             Gray4TextStyle::new(FONT_CONFIRM_TITLE, PALETTE.on_background),
         );
 
         let press_text = Column::new((
             Text::new(
-                "Press and hold".to_string(),
+                line1.to_string(),
                 Gray4TextStyle::new(FONT_CONFIRM_TEXT, PALETTE.text_secondary),
             ),
             Text::new(
-                "for 3 seconds".to_string(),
+                line2.to_string(),
                 Gray4TextStyle::new(FONT_CONFIRM_TEXT, PALETTE.text_secondary),
             ),
         ));
@@ -454,7 +473,11 @@ type SignPromptPage = AnyOf<(
 )>;
 
 impl SignPromptPageList {
-    pub fn new_with_seed(prompt: PromptSignBitcoinTx, rand_seed: u32) -> Self {
+    pub fn new_with_seed(
+        prompt: PromptSignBitcoinTx,
+        rand_seed: u32,
+        kind: SignPromptKind,
+    ) -> Self {
         let num_recipients = prompt.recipients.len();
         let has_warning = Self::has_high_fee(&prompt);
 
@@ -464,6 +487,7 @@ impl SignPromptPageList {
             prompt,
             total_pages,
             rand_seed,
+            kind,
         }
     }
 
@@ -558,7 +582,7 @@ impl WidgetList for SignPromptPageList {
                 false,
             )
         } else {
-            (SignPromptPage::new(ConfirmationPage::new()), false)
+            (SignPromptPage::new(ConfirmationPage::new(self.kind)), false)
         };
 
         let mut item = WidgetListItem::new(page);
@@ -594,7 +618,16 @@ impl SignTxPrompt {
     }
 
     pub fn new_with_seed(prompt: PromptSignBitcoinTx, rand_seed: u32) -> Self {
-        let page_list = SignPromptPageList::new_with_seed(prompt, rand_seed);
+        Self::new_with_kind(prompt, rand_seed, SignPromptKind::Sign)
+    }
+
+    /// The review of a silent payment send before the device contributes its ECDH shares.
+    pub fn new_sp_ecdh(prompt: PromptSignBitcoinTx, rand_seed: u32) -> Self {
+        Self::new_with_kind(prompt, rand_seed, SignPromptKind::SpEcdh)
+    }
+
+    fn new_with_kind(prompt: PromptSignBitcoinTx, rand_seed: u32, kind: SignPromptKind) -> Self {
+        let page_list = SignPromptPageList::new_with_seed(prompt, rand_seed, kind);
         let mut page_slider = Box::new(PageSlider::new(page_list));
         page_slider.set_on_page_ready(|page| {
             if let Some(confirmation_page) = page.downcast_mut::<ConfirmationPage>() {
@@ -675,6 +708,7 @@ mod test {
                 PromptDestination::Address(address()),
             ]),
             0,
+            SignPromptKind::Sign,
         );
         let one_unrenderable = SignPromptPageList::new_with_seed(
             prompt_of(alloc::vec![
@@ -682,6 +716,7 @@ mod test {
                 PromptDestination::UnrecognizedScript(data_carrier),
             ]),
             0,
+            SignPromptKind::Sign,
         );
 
         assert_eq!(all_addressable.len(), one_unrenderable.len());

@@ -3,7 +3,7 @@ use bitcoin::Address;
 use frost_backup::ShareBackup;
 use frostsnap_comms::Sha256Digest;
 use frostsnap_core::{
-    device::{restoration::EnterBackupPhase, KeyGenPhase3, SignPhase1},
+    device::{restoration::EnterBackupPhase, KeyGenPhase3, SignPhase1, SpEcdhPhase},
     schnorr_fun::frost::ShareIndex,
     tweak::BitcoinBip32Path,
     AccessStructureRef, SignTask,
@@ -39,6 +39,12 @@ pub enum WidgetTree {
     SignTxPrompt {
         widget: Box<SignTxPrompt>,
         phase: Option<Box<SignPhase1>>,
+    },
+
+    /// Silent payment ECDH confirmation prompt screen
+    SpEcdhPrompt {
+        widget: Box<SignTxPrompt>,
+        phase: Option<Box<SpEcdhPhase>>,
     },
 
     /// Sign test message prompt screen
@@ -152,6 +158,29 @@ impl WidgetTree {
                 }
             }
             SignTask::Nostr { .. } => {
+                let mut standby = Standby::new(crate::FIRMWARE_VERSION);
+                standby.set_welcome();
+                Self::Standby(Box::new(standby))
+            }
+        }
+    }
+
+    #[inline(never)]
+    pub(crate) fn build_sp_ecdh_prompt(phase: Box<SpEcdhPhase>, rand_seed: u32) -> Self {
+        match &phase.sign_task().inner {
+            SignTask::BitcoinTransaction {
+                tx_template,
+                network,
+            } => {
+                let prompt = tx_template.user_prompt(*network);
+                let widget = Box::new(SignTxPrompt::new_sp_ecdh(prompt, rand_seed));
+                Self::SpEcdhPrompt {
+                    widget,
+                    phase: Some(phase),
+                }
+            }
+            // recv_sp_ecdh_request rejects other sign tasks, so this is not expected.
+            _ => {
                 let mut standby = Standby::new(crate::FIRMWARE_VERSION);
                 standby.set_welcome();
                 Self::Standby(Box::new(standby))

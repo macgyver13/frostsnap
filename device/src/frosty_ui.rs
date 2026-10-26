@@ -197,6 +197,9 @@ impl<'a> UserInteraction for FrostyUi<'a> {
                 Prompt::Signing { phase, rand_seed } => {
                     WidgetTree::build_signing_prompt(phase, rand_seed)
                 }
+                Prompt::SpEcdh { phase, rand_seed } => {
+                    WidgetTree::build_sp_ecdh_prompt(phase, rand_seed)
+                }
                 Prompt::ConfirmFirmwareUpgrade {
                     firmware_digest,
                     size,
@@ -300,6 +303,19 @@ impl<'a> UserInteraction for FrostyUi<'a> {
             } => {
                 if let Some(phase_data) = phase.take_if(|_| sign_prompt.is_confirmed()) {
                     return Some(UiEvent::SigningConfirm { phase: phase_data });
+                }
+                if phase.is_none() && sign_prompt.is_finished() {
+                    self.go_to_default();
+                }
+            }
+            WidgetTree::SpEcdhPrompt {
+                widget: sign_prompt,
+                phase,
+            } => {
+                if sign_prompt.is_confirmed() {
+                    if let Some(phase_data) = phase.take() {
+                        return Some(UiEvent::SpEcdhConfirm { phase: phase_data });
+                    }
                 }
                 if phase.is_none() && sign_prompt.is_finished() {
                     self.go_to_default();
