@@ -148,6 +148,14 @@ impl UnsignedTx {
         self.template_tx.has_silent_payment_outputs()
     }
 
+    /// The check code of this transaction's outputs, as the devices show it on the hold page.
+    #[frb(sync)]
+    pub fn outputs_check_code(&self, network: super::bitcoin::BitcoinNetwork) -> String {
+        frostsnap_core::bitcoin_transaction::fingerprint_code(
+            &self.template_tx.outputs_fingerprint(network),
+        )
+    }
+
     /// Whether we alone can produce something broadcastable.
     ///
     /// `false` for a PSBT holding inputs that are not ours: our signatures go back into the

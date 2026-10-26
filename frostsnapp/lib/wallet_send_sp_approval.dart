@@ -6,9 +6,11 @@ import 'package:frostsnap/global.dart';
 import 'package:frostsnap/secure_key_provider.dart';
 import 'package:frostsnap/snackbar.dart';
 import 'package:frostsnap/src/rust/api.dart';
+import 'package:frostsnap/src/rust/api/bitcoin.dart';
 import 'package:frostsnap/src/rust/api/device_list.dart';
 import 'package:frostsnap/src/rust/api/signing.dart';
 import 'package:frostsnap/theme.dart';
+import 'package:frostsnap/wallet_tx_details.dart';
 
 /// Runs the ECDH round of a send with silent payment outputs: each selected device reviews the
 /// send and contributes its shares. Once a threshold have, signing is opened from them and its
@@ -19,6 +21,7 @@ Future<SignSessionId?> showSilentPaymentApproval(
   required UnsignedTx unsignedTx,
   required List<DeviceId> devices,
   required int threshold,
+  required BitcoinNetwork network,
 }) async {
   final encryptionKey = await SecureKeyProvider.getEncryptionKey();
   if (!context.mounted) return null;
@@ -31,6 +34,7 @@ Future<SignSessionId?> showSilentPaymentApproval(
       devices: devices,
       threshold: threshold,
       encryptionKey: encryptionKey,
+      checkCode: unsignedTx.outputsCheckCode(network: network),
       scrollController: scrollController,
     ),
   );
@@ -42,6 +46,7 @@ class _SilentPaymentApproval extends StatefulWidget {
   final List<DeviceId> devices;
   final int threshold;
   final SymmetricKey encryptionKey;
+  final String checkCode;
   final ScrollController scrollController;
 
   const _SilentPaymentApproval({
@@ -50,6 +55,7 @@ class _SilentPaymentApproval extends StatefulWidget {
     required this.devices,
     required this.threshold,
     required this.encryptionKey,
+    required this.checkCode,
     required this.scrollController,
   });
 
@@ -175,6 +181,10 @@ class _SilentPaymentApprovalState extends State<_SilentPaymentApproval> {
             'Check the silent payment address on each device and hold to contribute. This is not signing yet.',
             style: theme.textTheme.bodyMedium,
           ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: DialogCheckCode(widget.checkCode),
         ),
         ListTile(
           title: const Text('Devices'),

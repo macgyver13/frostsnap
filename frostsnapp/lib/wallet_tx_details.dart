@@ -365,13 +365,19 @@ class _TxDetailsPageState extends State<TxDetailsPage> {
 
   FullscreenActionDialogController<void>? actionDialogController;
 
+  /// The code the device shows on its hold page, shown in the dialog that covers this page while
+  /// the device asks for the hold.
+  String? _checkCode;
+
   FullscreenActionDialogController<void> _buildActionDialogController(
     List<DeviceId> devices,
   ) {
+    final checkCode = _checkCode;
     return FullscreenActionDialogController<void>(
       context: context,
       devices: devices,
       title: 'Sign transaction with connected device',
+      body: checkCode == null ? null : (_) => DialogCheckCode(checkCode),
       actionButtons: [
         Builder(
           builder: (dialogContext) => TextButton(
@@ -514,6 +520,12 @@ class _TxDetailsPageState extends State<TxDetailsPage> {
     super.initState();
 
     txDetails = widget.txDetails;
+    final network = WalletContext.of(context)?.network;
+    if (widget.signingParams case TxNeedsSignatures(
+      :final unsignedTx,
+    ) when network != null) {
+      _checkCode = unsignedTx.outputsCheckCode(network: network);
+    }
     ssid = switch (widget.signingParams) {
       // Known before the first state arrives, so Cancel works straight away.
       RestoreSigning(:final sessionId) => sessionId,
@@ -1227,4 +1239,36 @@ void showExportPsbtDialog(BuildContext context, Psbt psbt) async {
       ),
     ),
   );
+}
+
+/// The outputs check code, for the user to compare with the one the device shows on its hold page.
+class DialogCheckCode extends StatelessWidget {
+  final String code;
+
+  const DialogCheckCode(this.code, {super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      children: [
+        Text(
+          'Check code (compare with device)',
+          style: theme.textTheme.labelLarge?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 4),
+        SelectableText(
+          code,
+          textAlign: TextAlign.center,
+          style: monospaceTextStyle.copyWith(
+            fontSize: 22,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 1.5,
+          ),
+        ),
+      ],
+    );
+  }
 }

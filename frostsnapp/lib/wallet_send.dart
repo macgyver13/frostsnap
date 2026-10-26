@@ -679,6 +679,7 @@ class _WalletSendPageState extends State<WalletSendPage> {
         unsignedTx: unsignedTx,
         devices: state.selectedSigners().toList(),
         threshold: access.threshold(),
+        network: walletCtx.network,
       );
       if (signSessionId == null || !context.mounted) return;
       final restored = RestoreSigning.of(
