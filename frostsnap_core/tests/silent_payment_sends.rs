@@ -4,18 +4,23 @@
 use bitcoin::{hashes::Hash, Amount, Network, OutPoint, Txid};
 use frostsnap_core::{
     bitcoin_transaction::{LocalSpk, PromptDestination, PushInput, TransactionTemplate},
+    coordinator::{CoordinatorSend, SignSession, StartSignError},
     device::KeyPurpose,
+    message::signing::SpEcdhSessionId,
     message::{
         signing::{CoordinatorSigning, DeviceSigning},
         CoordinatorToDeviceMessage, DeviceToCoordinatorMessage,
     },
     silent_payments::SilentPaymentRecipient,
     tweak::{BitcoinBip32Path, NormalIndex},
-    AccessStructureRef, MasterAppkey, SignTaskError, WireSignTask,
+    AccessStructureRef, DeviceId, MasterAppkey, SignTaskError, WireSignTask,
 };
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
-use schnorr_fun::fun::{g, marker::*, Point, Scalar, G};
-use std::collections::BTreeSet;
+use schnorr_fun::{
+    fun::{g, marker::*, Point, Scalar, G},
+    Schnorr,
+};
+use std::collections::{BTreeMap, BTreeSet};
 
 mod common;
 mod env;
@@ -216,26 +221,41 @@ fn wallet(seed: u8) -> Wallet {
     }
 }
 
-/// Starts an ECDH round for a send of one silent payment to `recipient`, asking the first two
-/// devices, which is a threshold.
-fn start_ecdh(wallet: &mut Wallet, recipient: (SilentPaymentRecipient, String)) {
+/// Starts an ECDH round for a send of one silent payment to `recipient`, asking `devices`.
+/// Returns the session and the requests, which the caller delivers.
+fn start_ecdh_with(
+    wallet: &mut Wallet,
+    recipient: (SilentPaymentRecipient, String),
+    devices: &BTreeSet<DeviceId>,
+) -> (SpEcdhSessionId, Vec<CoordinatorSend>) {
     let mut template = TransactionTemplate::new();
     owned_input(&mut template, wallet.master_appkey, 100_000);
     template.push_silent_payment_output(Amount::from_sat(50_000), recipient.0, recipient.1);
-    let devices: BTreeSet<_> = wallet.run.device_vec().into_iter().take(2).collect();
-
-    let (_, sends) = wallet
+    wallet
         .run
         .coordinator
         .start_sp_ecdh(
             wallet.access_structure_ref,
             WireSignTask::BitcoinTransaction(template),
-            &devices,
+            devices,
             TEST_ENCRYPTION_KEY,
             &mut wallet.rng,
         )
-        .unwrap();
+        .unwrap()
+}
+
+/// Starts an ECDH round asking the first two devices, which is a threshold, and delivers it.
+fn start_ecdh(wallet: &mut Wallet, recipient: (SilentPaymentRecipient, String)) {
+    let devices: BTreeSet<_> = wallet.run.device_vec().into_iter().take(2).collect();
+    let (_, sends) = start_ecdh_with(wallet, recipient, &devices);
     wallet.run.extend(sends);
+}
+
+fn asked_device(send: &CoordinatorSend) -> DeviceId {
+    let CoordinatorSend::ToDevice { destinations, .. } = send else {
+        panic!("an ECDH request is addressed to a device");
+    };
+    *destinations.iter().next().expect("one destination")
 }
 
 #[test]
@@ -307,6 +327,175 @@ fn coordinator_refuses_a_device_with_a_bad_proof() {
         error
             .to_string()
             .contains("silent payment ECDH share has a bad proof"),
+        "refused for the wrong reason: {error}"
+    );
+}
+
+/// A local send asks every selected device, then signs with the ones that answered once there is a
+/// threshold. The devices are asked with the proofs, and the signed transaction pays the silent
+/// payment output a derived script.
+#[test]
+fn local_silent_payment_send_signs_with_the_devices_that_answered() {
+    let mut wallet = wallet(31);
+    let selected: BTreeSet<_> = wallet.run.device_vec().into_iter().collect();
+    let (ecdh_session, sends) = start_ecdh_with(&mut wallet, recipient(0x31, 0x32), &selected);
+    assert_eq!(sends.len(), 3, "one request per selected device");
+
+    // The third device never answers.
+    let signers: BTreeSet<_> = sends.iter().take(2).map(asked_device).collect();
+    wallet.run.extend(sends.into_iter().take(2));
+    wallet
+        .run
+        .run_until_finished(&mut wallet.env, &mut wallet.rng)
+        .unwrap();
+
+    let session_id = wallet
+        .run
+        .coordinator
+        .start_sign_sp(ecdh_session, &mut wallet.rng)
+        .unwrap();
+    let signing_set: BTreeSet<_> = wallet
+        .run
+        .coordinator
+        .active_signing_sessions_by_ssid()
+        .get(&session_id)
+        .unwrap()
+        .init
+        .nonces
+        .keys()
+        .copied()
+        .collect();
+    assert_eq!(signing_set, signers);
+
+    for device_id in &signers {
+        let sign_req =
+            wallet
+                .run
+                .coordinator
+                .request_device_sign(session_id, *device_id, TEST_ENCRYPTION_KEY);
+        wallet.run.extend(sign_req);
+    }
+    assert!(
+        wallet.run.message_queue.iter().all(|send| matches!(
+            send,
+            Send::CoordinatorToDevice {
+                message: CoordinatorToDeviceMessage::Signing(CoordinatorSigning::RequestSpSign(_)),
+                ..
+            }
+        )),
+        "the devices must be asked with RequestSpSign"
+    );
+    wallet
+        .run
+        .run_until_finished(&mut wallet.env, &mut wallet.rng)
+        .unwrap();
+
+    let Some(SignSession::Finished(finished)) = wallet.run.coordinator.get_sign_session(session_id)
+    else {
+        panic!("the send should have finished");
+    };
+    let checked = finished
+        .init
+        .group_request
+        .sign_task
+        .clone()
+        .check(wallet.master_appkey, purpose())
+        .unwrap();
+    let signatures = wallet.env.signatures.get(&session_id).unwrap();
+    assert!(checked.verify_final_signatures(&Schnorr::<sha2::Sha256>::verify_only(), signatures));
+
+    let WireSignTask::BitcoinTransaction(paid) = &finished.init.group_request.sign_task else {
+        panic!("expected a bitcoin transaction");
+    };
+    let output = paid.silent_payment_outputs().next().unwrap();
+    assert!(output
+        .script
+        .as_ref()
+        .is_some_and(|script| script.is_p2tr()));
+}
+
+#[test]
+fn local_ecdh_refuses_to_open_signing_before_a_threshold_has_answered() {
+    let mut wallet = wallet(33);
+    let selected: BTreeSet<_> = wallet.run.device_vec().into_iter().take(2).collect();
+    let (ecdh_session, sends) = start_ecdh_with(&mut wallet, recipient(0x33, 0x34), &selected);
+    // Only one of the two answers.
+    wallet.run.extend(sends.into_iter().take(1));
+    wallet
+        .run
+        .run_until_finished(&mut wallet.env, &mut wallet.rng)
+        .unwrap();
+
+    let result = wallet
+        .run
+        .coordinator
+        .start_sign_sp(ecdh_session, &mut wallet.rng);
+    assert!(
+        matches!(
+            result,
+            Err(StartSignError::NotEnoughDevicesSelected { selected: 1, .. })
+        ),
+        "got {result:?}"
+    );
+}
+
+/// A device rederives the silent payment scripts from the proofs before it shows a sign request,
+/// so a host that swaps a script is refused.
+#[test]
+fn device_refuses_a_sign_request_whose_script_does_not_match_the_proofs() {
+    let mut wallet = wallet(35);
+    let selected: BTreeSet<_> = wallet.run.device_vec().into_iter().take(2).collect();
+    let (ecdh_session, sends) = start_ecdh_with(&mut wallet, recipient(0x35, 0x36), &selected);
+    wallet.run.extend(sends);
+    wallet
+        .run
+        .run_until_finished(&mut wallet.env, &mut wallet.rng)
+        .unwrap();
+    let session_id = wallet
+        .run
+        .coordinator
+        .start_sign_sp(ecdh_session, &mut wallet.rng)
+        .unwrap();
+    for device_id in &selected {
+        let sign_req =
+            wallet
+                .run
+                .coordinator
+                .request_device_sign(session_id, *device_id, TEST_ENCRYPTION_KEY);
+        wallet.run.extend(sign_req);
+    }
+
+    let result =
+        wallet
+            .run
+            .run_until(&mut wallet.env, &mut wallet.rng, |run| {
+                for send in run.message_queue.iter_mut() {
+                    if let Send::CoordinatorToDevice {
+                        message:
+                            CoordinatorToDeviceMessage::Signing(CoordinatorSigning::RequestSpSign(
+                                request,
+                            )),
+                        ..
+                    } = send
+                    {
+                        let WireSignTask::BitcoinTransaction(template) =
+                            &mut request.request_sign.group_sign_req.sign_task
+                        else {
+                            unreachable!("a silent payment send is a bitcoin transaction")
+                        };
+                        // A well formed P2TR script, from a secret that is not the wallet's ECDH.
+                        let scan_key = template.silent_payment_scan_keys()[0];
+                        let not_the_ecdh = BTreeMap::from([(scan_key, public(scalar(0x99)))]);
+                        *template = template.with_sp_scripts(&not_the_ecdh).unwrap();
+                    }
+                }
+                run.message_queue.is_empty()
+            });
+    let error = result.expect_err("the device must refuse the swapped script");
+    assert!(
+        error
+            .to_string()
+            .contains("silent payment output scripts do not match the ECDH shares"),
         "refused for the wrong reason: {error}"
     );
 }

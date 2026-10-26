@@ -1,7 +1,8 @@
 use crate::{
-    message::signing::SpEcdhSessionId, nonce_stream::NonceStreamSegment,
-    silent_payments::EcdhShare, AccessStructureRef, DeviceId, KeyId, Kind, SignSessionId,
-    WireSignTask,
+    message::signing::{SpEcdhSessionId, SpProofBundle},
+    nonce_stream::NonceStreamSegment,
+    silent_payments::EcdhShare,
+    AccessStructureRef, DeviceId, KeyId, Kind, SignSessionId, WireSignTask,
 };
 use alloc::{
     collections::{BTreeMap, BTreeSet},
@@ -56,6 +57,11 @@ pub enum SigningMutation {
     CloseSpEcdhSession {
         session_id: SpEcdhSessionId,
     },
+    /// The proofs the devices of a silent payment sign session check its outputs against.
+    SpProofsForSession {
+        session_id: SignSessionId,
+        sp_proofs: SpProofBundle,
+    },
 }
 
 impl SigningMutation {
@@ -77,7 +83,8 @@ impl SigningMutation {
             SigningMutation::SentSignReq { session_id, .. }
             | SigningMutation::GotSignatureSharesFromDevice { session_id, .. }
             | SigningMutation::CloseSignSession { session_id, .. }
-            | SigningMutation::ForgetFinishedSignSession { session_id } => {
+            | SigningMutation::ForgetFinishedSignSession { session_id }
+            | SigningMutation::SpProofsForSession { session_id, .. } => {
                 Some(coord.get_sign_session(*session_id)?.key_id())
             }
         }

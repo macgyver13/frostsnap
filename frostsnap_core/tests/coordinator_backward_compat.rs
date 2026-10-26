@@ -8,7 +8,7 @@ use frostsnap_core::coordinator::{
     ActiveSignSession, CompleteKey, CoordAccessStructure, Mutation, SignSessionProgress, StartSign,
 };
 use frostsnap_core::device::KeyPurpose;
-use frostsnap_core::message::signing::SpEcdhSessionId;
+use frostsnap_core::message::signing::{SpEcdhSessionId, SpProofBundle};
 use frostsnap_core::message::HeldShare2;
 use frostsnap_core::message::{EncodedSignature, GroupSignReq};
 use frostsnap_core::nonce_stream::{CoordNonceStreamState, NonceStreamId, NonceStreamSegment};
@@ -328,6 +328,13 @@ fn test_all_coordinator_mutations() {
         Mutation::Signing(SigningMutation::CloseSpEcdhSession {
             session_id: SpEcdhSessionId([17u8; 32]),
         }),
+        Mutation::Signing(SigningMutation::SpProofsForSession {
+            session_id: SignSessionId([12u8; 32]),
+            sp_proofs: SpProofBundle {
+                app_poly: vec![g!(8 * G).normalize().mark_zero()],
+                shares: vec![ecdh_share],
+            },
+        }),
     ];
 
     // Test each mutation
@@ -460,6 +467,12 @@ fn test_all_coordinator_mutations() {
                 assert_bincode_hex_eq!(
                     mutation,
                     "01081111111111111111111111111111111111111111111111111111111111111111"
+                );
+            }
+            Mutation::Signing(SigningMutation::SpProofsForSession { .. }) => {
+                assert_bincode_hex_eq!(
+                    mutation,
+                    "01090c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c01022f01e5e15cca351daff3843fb70f3c2f0a1bdd05e5af888a67784ef3e10a2a0101025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc000000000000000000000000000000000000000000000000000000000000000103acd484e2f0c7f65309ad178a9f559abde09796974c57e714c35f110dfc27ccbe10101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010"
                 );
             }
             Mutation::Restoration(RestorationMutation::NewRestoration2 { .. }) => {
