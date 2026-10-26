@@ -374,11 +374,15 @@ class _TxDetailsPageState extends State<TxDetailsPage> {
       title: 'Sign transaction with connected device',
       actionButtons: [
         Builder(
-          builder: (context) => OutlinedButton(
-            child: Text('Cancel'),
-            onPressed: _onCancelSigning,
+          builder: (dialogContext) => TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor: Theme.of(dialogContext).colorScheme.error,
+            ),
+            onPressed: () => _cancelSigning(dialogContext),
+            child: const Text('Cancel'),
           ),
         ),
+        TextButton(onPressed: _leaveSigning, child: const Text('Later')),
         DeviceActionHint(),
       ],
       onDismissed: () {},
@@ -479,11 +483,12 @@ class _TxDetailsPageState extends State<TxDetailsPage> {
     }
   }
 
-  void _onCancelSigning() async {
+  void _leaveSigning() async {
     if (signingDone) return;
-    // Dismiss the fullscreen sign dialog first — otherwise the controller
-    // would reshow it as soon as it notices a target device still connected.
-    // Then pop this page; `dispose()` handles the Rust-side protocol cancel.
+    // Leave the session open so the wallet can continue it. Dismiss the
+    // fullscreen sign dialog first, otherwise the controller would reshow it
+    // as soon as it notices a target device still connected. Then pop this
+    // page; `dispose()` takes the devices off the signing screen.
     await actionDialogController?.clearAllActionsNeeded();
     if (!mounted) return;
     Navigator.pop(context);
@@ -509,7 +514,11 @@ class _TxDetailsPageState extends State<TxDetailsPage> {
     super.initState();
 
     txDetails = widget.txDetails;
-    ssid = widget.finishedSigningSessionId;
+    ssid = switch (widget.signingParams) {
+      // Known before the first state arrives, so Cancel works straight away.
+      RestoreSigning(:final sessionId) => sessionId,
+      _ => widget.finishedSigningSessionId,
+    };
     psbt = widget.psbt;
     // Attempt to get psbt elsewhere.
     if (psbt == null && ssid != null) {
@@ -712,7 +721,7 @@ class _TxDetailsPageState extends State<TxDetailsPage> {
           child: Padding(
             padding: EdgeInsets.symmetric(vertical: 4.0, horizontal: 12.0),
             child: TextButton(
-              onPressed: () async => showCancelSigningDialog(context),
+              onPressed: () => _cancelSigning(context),
               style: TextButton.styleFrom(
                 foregroundColor: theme.colorScheme.error,
               ),
@@ -858,7 +867,10 @@ class _TxDetailsPageState extends State<TxDetailsPage> {
     }
   }
 
-  showCancelSigningDialog(BuildContext context) async {
+  /// Drop the signing session, unlike [_leaveSigning]. Asked from the
+  /// fullscreen dialog or the signatures card, so the confirmation is shown
+  /// over whichever [context] asked.
+  Future<void> _cancelSigning(BuildContext context) async {
     final result = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -877,11 +889,15 @@ class _TxDetailsPageState extends State<TxDetailsPage> {
         ],
       ),
     );
-    if (result ?? false) {
-      if (ssid == null) return;
-      await coord.cancelSignSession(ssid: ssid!);
-      if (context.mounted) Navigator.pop(context);
-    }
+    if (!(result ?? false) || ssid == null || !mounted) return;
+    // Take the devices off the signing screen before the session closes, so
+    // a share arriving in between does not find the session gone.
+    signingSub?.cancel();
+    signingSub = null;
+    coord.cancelProtocol();
+    await coord.cancelSignSession(ssid: ssid!);
+    await actionDialogController?.clearAllActionsNeeded();
+    if (mounted) Navigator.pop(this.context);
   }
 
   bool isBroadcasting = false;
@@ -941,8 +957,9 @@ class _TxDetailsPageState extends State<TxDetailsPage> {
           broadcastDone = true;
           signingState = null;
         });
-        // Remove signing session on successful broadcast.
-        final finishedSsid = widget.finishedSigningSessionId;
+        // Remove signing session on successful broadcast. A page that signed
+        // it holds the session in `ssid` instead.
+        final finishedSsid = widget.finishedSigningSessionId ?? ssid;
         if (finishedSsid != null)
           await coord.forgetFinishedSignSession(ssid: finishedSsid);
         await Future.delayed(
