@@ -499,6 +499,7 @@ macro_rules! demo_widget {
                     ],
                     fee: bitcoin::Amount::from_sat(90_000), // >5% of the value moved, so the warning page shows
                     fee_rate_sats_per_vbyte: Some(12.5), // Example: 12.5 sats/vB fee rate
+                    outputs_fingerprint: [0xab; 32], // placeholder for the demo
                 };
 
                 // Create the sign prompt widget
@@ -523,6 +524,7 @@ macro_rules! demo_widget {
                     }],
                     fee: bitcoin::Amount::from_sat(1_500),
                     fee_rate_sats_per_vbyte: Some(8.5),
+                    outputs_fingerprint: [0xab; 32], // placeholder for the demo
                 };
 
                 let widget = SignTxPrompt::new_sp_ecdh(prompt, 0);

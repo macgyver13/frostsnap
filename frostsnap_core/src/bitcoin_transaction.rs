@@ -1,5 +1,9 @@
 use alloc::vec::Vec;
-use alloc::{boxed::Box, collections::BTreeMap, string::String};
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    string::{String, ToString},
+};
 use bitcoin::{
     consensus::Encodable,
     hashes::{sha256d, Hash},
@@ -14,6 +18,34 @@ use crate::{
     tweak::{AppTweak, BitcoinBip32Path, Keychain},
     MasterAppkey,
 };
+use schnorr_fun::fun::hash::Tag;
+use sha2::{Digest, Sha256};
+
+const OUTPUT_IS_ADDRESS: u8 = 0x00;
+const OUTPUT_IS_SCRIPT_HEX: u8 = 0x01;
+
+/// The first 16 bytes of an outputs fingerprint as eight groups of hex, e.g.
+/// `ab12 cd34 ef56 7890 ...`, for the user to compare between the app and the device.
+///
+/// This is a convenience, not a security guarantee. An app that builds both the outputs it
+/// shows and the outputs it signs controls free details (change index, change amount, order),
+/// so with a truncated code it only needs a collision. The device's own review of the outputs
+/// is the security boundary.
+pub fn fingerprint_code(fp: &[u8; 32]) -> String {
+    fp[..16]
+        .chunks(2)
+        .map(|c| alloc::format!("{:02x}{:02x}", c[0], c[1]))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// An address for `spk` on `network`, or the hex of the script when it has no address form.
+fn address_or_script_hex(spk: &Script, network: bitcoin::Network) -> (u8, String) {
+    match bitcoin::Address::from_script(spk, network) {
+        Ok(address) => (OUTPUT_IS_ADDRESS, address.to_string()),
+        Err(_) => (OUTPUT_IS_SCRIPT_HEX, alloc::format!("{spk:x}")),
+    }
+}
 
 /// Marks a template that has not been narrowed to any one key: the form that travels.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, bincode::Encode, bincode::Decode)]
@@ -183,6 +215,26 @@ impl<S> TransactionTemplate<S> {
             .map(|input| input.value)
             .sum::<u64>()
             .checked_sub(self.outputs.iter().map(|output| output.value).sum())
+    }
+
+    /// A hash of every output's index, value and address on `network`, in order. A silent
+    /// payment output contributes the address it was given, so the fingerprint stays the same
+    /// once its script is filled in.
+    pub fn outputs_fingerprint(&self, network: bitcoin::Network) -> [u8; 32] {
+        let mut hash = Sha256::default().tag(b"frostsnap/outputs/v2");
+        for (i, output) in self.outputs.iter().enumerate() {
+            let (form, text) = match &output.owner {
+                SpkOwner::SilentPayment(sp) => (OUTPUT_IS_ADDRESS, sp.address.clone()),
+                SpkOwner::Foreign(spk) => address_or_script_hex(spk, network),
+                SpkOwner::Local(local) => address_or_script_hex(&local.spk(), network),
+            };
+            hash.update((i as u32).to_le_bytes());
+            hash.update(output.value.to_le_bytes());
+            hash.update([form]);
+            hash.update((text.len() as u64).to_le_bytes());
+            hash.update(text.as_bytes());
+        }
+        hash.finalize().into()
     }
 }
 
@@ -512,6 +564,7 @@ impl TransactionTemplate<ScopedTo> {
             recipients,
             fee,
             fee_rate_sats_per_vbyte,
+            outputs_fingerprint: self.outputs_fingerprint(network),
         }
     }
 }
@@ -555,9 +608,16 @@ pub struct PromptSignBitcoinTx {
     pub fee: bitcoin::Amount,
     /// Fee rate in sats/vB
     pub fee_rate_sats_per_vbyte: Option<f64>,
+    /// See [`TransactionTemplate::outputs_fingerprint`].
+    pub outputs_fingerprint: [u8; 32],
 }
 
 impl PromptSignBitcoinTx {
+    /// The check code the user compares between the app and the device.
+    pub fn fingerprint_code(&self) -> String {
+        fingerprint_code(&self.outputs_fingerprint)
+    }
+
     /// Total value the prompt itemises as moving.
     pub fn value_moved(&self) -> bitcoin::Amount {
         self.recipients.iter().map(|r| r.amount).sum()

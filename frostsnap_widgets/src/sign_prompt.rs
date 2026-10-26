@@ -402,7 +402,15 @@ impl WarningPage {
     }
 }
 
-/// Confirmation page with HoldToConfirm
+/// Splits the eight groups of a check code onto two lines of four groups each.
+fn check_code_two_lines(code: &str) -> String {
+    match code.match_indices(' ').nth(3) {
+        Some((i, _)) => format!("{}\n{}", &code[..i], &code[i + 1..]),
+        None => code.to_string(),
+    }
+}
+
+/// Confirmation page with HoldToConfirm, and the check code the user compares with the app.
 #[derive(frostsnap_macros::Widget)]
 pub struct ConfirmationPage {
     #[widget_delegate]
@@ -410,13 +418,14 @@ pub struct ConfirmationPage {
         Column<(
             Text<Gray4TextStyle>,
             Column<(Text<Gray4TextStyle>, Text<Gray4TextStyle>)>,
+            Text<Gray4TextStyle>,
         )>,
     >,
 }
 
 impl ConfirmationPage {
     #[inline(never)]
-    fn new(kind: SignPromptKind) -> Self {
+    fn new(kind: SignPromptKind, fingerprint_code: &str) -> Self {
         let (title, line1, line2) = match kind {
             SignPromptKind::Sign => ("Hold to Sign", "Press and hold", "for 3 seconds"),
             // Its own title and copy, so the user can tell the two steps apart.
@@ -442,10 +451,17 @@ impl ConfirmationPage {
             ),
         ));
 
-        let mut confirm_content = Column::new((sign_text, press_text))
+        let code_text = Text::new(
+            format!("Check code\n{}", check_code_two_lines(fingerprint_code)),
+            Gray4TextStyle::new(FONT_CONFIRM_TEXT, PALETTE.text_secondary),
+        )
+        .with_alignment(embedded_graphics::text::Alignment::Center);
+
+        let mut confirm_content = Column::new((sign_text, press_text, code_text))
             .with_main_axis_alignment(MainAxisAlignment::Center)
             .with_cross_axis_alignment(CrossAxisAlignment::Center);
-        confirm_content.set_gap(0, 15);
+        confirm_content.set_gap(0, 10);
+        confirm_content.set_gap(1, 10);
 
         let hold_confirm =
             HoldToConfirm::new(HOLD_TO_SIGN_TIME_MS, confirm_content).with_faded_out_button();
@@ -582,7 +598,13 @@ impl WidgetList for SignPromptPageList {
                 false,
             )
         } else {
-            (SignPromptPage::new(ConfirmationPage::new(self.kind)), false)
+            (
+                SignPromptPage::new(ConfirmationPage::new(
+                    self.kind,
+                    &self.prompt.fingerprint_code(),
+                )),
+                false,
+            )
         };
 
         let mut item = WidgetListItem::new(page);
@@ -692,6 +714,7 @@ mod test {
                 .collect(),
             fee: bitcoin::Amount::from_sat(100),
             fee_rate_sats_per_vbyte: Some(1.0),
+            outputs_fingerprint: [0; 32],
         }
     }
 
