@@ -10,13 +10,14 @@ use crate::{
 use anyhow::{anyhow, Result};
 use flutter_rust_bridge::frb;
 pub use frostsnap_coordinator::signing::SigningState;
+pub use frostsnap_coordinator::sp_ecdh::SpEcdhState;
 pub use frostsnap_core::bitcoin_transaction::{ScopedTo, TransactionTemplate};
 pub use frostsnap_core::coordinator::ActiveSignSession;
 pub use frostsnap_core::coordinator::{SignSessionProgress, StartSign};
 use frostsnap_core::MasterAppkey;
 use frostsnap_core::{
-    message::EncodedSignature, AccessStructureRef, DeviceId, KeyId, SignSessionId, SymmetricKey,
-    WireSignTask,
+    message::{signing::SpEcdhSessionId, EncodedSignature},
+    AccessStructureRef, DeviceId, KeyId, SignSessionId, SymmetricKey, WireSignTask,
 };
 use std::collections::HashSet;
 use tracing::{event, Level};
@@ -48,6 +49,15 @@ pub struct _SigningState {
     pub finished_signatures: Option<Vec<EncodedSignature>>,
     pub aborted: Option<String>,
     pub connected_but_need_request: Vec<DeviceId>,
+}
+
+#[frb(mirror(SpEcdhState), unignore)]
+pub struct _SpEcdhState {
+    pub session_id: SpEcdhSessionId,
+    pub confirmed: Vec<DeviceId>,
+    pub needed_from: Vec<DeviceId>,
+    pub connected_but_need_request: Vec<DeviceId>,
+    pub aborted: Option<String>,
 }
 
 #[frb(mirror(ActiveSignSession), unignore)]
@@ -129,6 +139,13 @@ impl UnsignedTx {
     #[frb(ignore)]
     fn scoped(&self) -> TransactionTemplate<ScopedTo> {
         self.template_tx.as_seen_by(self.master_appkey)
+    }
+
+    /// A send with silent payment outputs runs an ECDH round with the devices before it can be
+    /// signed, see [`Coordinator::start_sp_send`].
+    #[frb(sync)]
+    pub fn has_silent_payment_outputs(&self) -> bool {
+        self.template_tx.has_silent_payment_outputs()
     }
 
     /// Whether we alone can produce something broadcastable.
@@ -287,6 +304,48 @@ impl Coordinator {
                 sink,
             )
         })
+    }
+
+    /// Starts the ECDH round of a send with silent payment outputs, asking `devices` for their
+    /// shares. Once a threshold have confirmed, [`Self::start_sign_sp`] opens signing.
+    pub fn start_sp_send(
+        &self,
+        access_structure_ref: AccessStructureRef,
+        unsigned_tx: &UnsignedTx,
+        devices: Vec<DeviceId>,
+        encryption_key: SymmetricKey,
+        sink: StreamSink<SpEcdhState>,
+    ) -> Result<()> {
+        report_start_failure(sink, |sink| {
+            self.0.start_sp_ecdh(
+                access_structure_ref,
+                devices.into_iter().collect(),
+                WireSignTask::BitcoinTransaction(unsigned_tx.template_tx.clone()),
+                encryption_key,
+                sink,
+            )
+        })
+    }
+
+    #[frb(sync)]
+    pub fn request_sp_ecdh(
+        &self,
+        session_id: SpEcdhSessionId,
+        device_id: DeviceId,
+        encryption_key: SymmetricKey,
+    ) -> Result<()> {
+        self.0
+            .request_sp_ecdh(session_id, device_id, encryption_key)
+    }
+
+    /// Opens signing with the devices that confirmed the ECDH round. The session is then followed
+    /// like any other, through [`Self::try_restore_signing_session`].
+    pub fn start_sign_sp(&self, session_id: SpEcdhSessionId) -> Result<SignSessionId> {
+        self.0.start_sign_sp(session_id)
+    }
+
+    pub fn cancel_sp_ecdh(&self, session_id: SpEcdhSessionId) -> Result<()> {
+        self.0.cancel_sp_ecdh(session_id)
     }
 
     #[frb(sync)]

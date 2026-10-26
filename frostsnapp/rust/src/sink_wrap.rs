@@ -62,6 +62,7 @@ bridge_sink!(KeyGenState);
 bridge_sink!(FirmwareUpgradeConfirmState);
 bridge_sink!(VerifyAddressProtocolState);
 bridge_sink!(SigningState);
+bridge_sink!(frostsnap_coordinator::sp_ecdh::SpEcdhState);
 bridge_sink!(bool);
 bridge_sink!(f32);
 bridge_sink!(ChainStatus);

@@ -21,6 +21,7 @@ use frostsnap_coordinator::genuine_check::GenuineCheck;
 use frostsnap_coordinator::nonce_replenish::NonceReplenishState;
 use frostsnap_coordinator::persist::{Persist, Persisted, TakeStaged};
 use frostsnap_coordinator::signing::SigningState;
+use frostsnap_coordinator::sp_ecdh::{SpEcdhDispatcher, SpEcdhState};
 use frostsnap_coordinator::verify_address::{VerifyAddressProtocol, VerifyAddressProtocolState};
 use frostsnap_coordinator::wait_for_single_device::{
     WaitForSingleDevice, WaitForSingleDeviceState,
@@ -38,6 +39,7 @@ use frostsnap_core::coordinator::{
 };
 use frostsnap_core::device::KeyPurpose;
 use frostsnap_core::schnorr_fun::fun::{marker::EvenY, Point};
+use frostsnap_core::message::signing::SpEcdhSessionId;
 use frostsnap_core::{
     message, schnorr_fun::frost::ShareIndex, AccessStructureRef, DeviceId, KeyId, KeygenId,
     RestorationId, SignSessionId, SymmetricKey, WireSignTask,
@@ -84,7 +86,11 @@ impl FfiCoordinator {
         let mut db_ = db.lock().unwrap();
 
         event!(Level::DEBUG, "loading core coordinator");
-        let coordinator = Persisted::<FrostCoordinator>::new(&mut db_, ())?;
+        let mut coordinator = Persisted::<FrostCoordinator>::new(&mut db_, ())?;
+        coordinator.staged_mutate(&mut db_, |coordinator| {
+            coordinator.cancel_all_sp_ecdh();
+            Ok(())
+        })?;
         event!(Level::DEBUG, "loading device names");
         let device_names = Persisted::<DeviceNames>::new(&mut db_, ())?;
         let genuine_check = match genuine_cert_key {
@@ -1090,6 +1096,108 @@ impl FfiCoordinator {
             self.emit_signing_signal(key_id);
         }
         Ok(())
+    }
+
+    /// Asks `devices` for their silent payment ECDH shares for `task`. The devices connected and
+    /// ready now are asked at once; the caller asks the rest with [`Self::request_sp_ecdh`] when
+    /// the state lists a device in `connected_but_need_request`.
+    pub fn start_sp_ecdh(
+        &self,
+        access_structure_ref: AccessStructureRef,
+        devices: BTreeSet<DeviceId>,
+        task: WireSignTask,
+        encryption_key: SymmetricKey,
+        sink: impl Sink<SpEcdhState>,
+    ) -> anyhow::Result<()> {
+        let mut coordinator = self.coordinator.lock().unwrap();
+        let (session_id, sends) =
+            coordinator.staged_mutate(&mut self.db.lock().unwrap(), |coordinator| {
+                Ok(coordinator.start_sp_ecdh(
+                    access_structure_ref,
+                    task,
+                    &devices,
+                    encryption_key,
+                    &mut rand::thread_rng(),
+                )?)
+            })?;
+        drop(coordinator);
+
+        // Like `start_protocol`, but the requests already built go to the devices connected now,
+        // so the caller only has to ask the ones that connect later.
+        let mut ui_protocol = SpEcdhDispatcher::new(devices, session_id, sink);
+        for device in self.device_list.lock().unwrap().devices() {
+            ui_protocol.connected(device.id, device.device_mode());
+        }
+        for send in sends {
+            ui_protocol.send_request(send);
+        }
+        ui_protocol.emit_state();
+        self.ui_stack.lock().unwrap().push(ui_protocol);
+        Ok(())
+    }
+
+    /// Asks `device_id` for its ECDH shares, including a device that disconnected and came back.
+    pub fn request_sp_ecdh(
+        &self,
+        session_id: SpEcdhSessionId,
+        device_id: DeviceId,
+        encryption_key: SymmetricKey,
+    ) -> anyhow::Result<()> {
+        // Coordinator and db before the UI stack, the order the run loop takes them in.
+        let send = {
+            let mut coordinator = self.coordinator.lock().unwrap();
+            coordinator.staged_mutate(&mut self.db.lock().unwrap(), |coordinator| {
+                Ok(coordinator.request_sp_ecdh(session_id, device_id, encryption_key)?)
+            })?
+        };
+        let mut ui_stack = self.ui_stack.lock().unwrap();
+        let dispatcher = ui_stack
+            .get_mut::<SpEcdhDispatcher>()
+            .filter(|dispatcher| dispatcher.session_id() == session_id)
+            .ok_or(anyhow!("silent payment approval is not running"))?;
+        dispatcher.send_request(send);
+        Ok(())
+    }
+
+    /// Opens signing from the devices that have answered the ECDH, once there are a threshold. The
+    /// approval round leaves the stack without clearing the devices, so signing can follow with
+    /// [`Self::try_restore_signing_session`].
+    pub fn start_sign_sp(&self, session_id: SpEcdhSessionId) -> anyhow::Result<SignSessionId> {
+        let (sign_session_id, key_id) = {
+            let mut db = self.db.lock().unwrap();
+            let mut coordinator = self.coordinator.lock().unwrap();
+            coordinator.staged_mutate(&mut *db, |coordinator| {
+                let sign_session_id =
+                    coordinator.start_sign_sp(session_id, &mut rand::thread_rng())?;
+                let key_id = coordinator
+                    .active_signing_sessions_by_ssid()
+                    .get(&sign_session_id)
+                    .expect("start_sign_sp opened it")
+                    .key_id;
+                Ok((sign_session_id, key_id))
+            })?
+        };
+        if let Some(dispatcher) = self
+            .ui_stack
+            .lock()
+            .unwrap()
+            .get_mut::<SpEcdhDispatcher>()
+            .filter(|dispatcher| dispatcher.session_id() == session_id)
+        {
+            dispatcher.finish();
+        }
+        self.emit_signing_signal(key_id);
+        Ok(sign_session_id)
+    }
+
+    /// Drops an ECDH round, discarding the shares collected so far.
+    pub fn cancel_sp_ecdh(&self, session_id: SpEcdhSessionId) -> anyhow::Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let mut coordinator = self.coordinator.lock().unwrap();
+        coordinator.staged_mutate(&mut *db, |coordinator| {
+            coordinator.cancel_sp_ecdh(session_id);
+            Ok(())
+        })
     }
 
     pub fn forget_finished_sign_session(&self, ssid: SignSessionId) -> anyhow::Result<()> {

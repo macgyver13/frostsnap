@@ -18,6 +18,7 @@ import 'package:frostsnap/genuine_badge.dart';
 import 'package:frostsnap/wallet.dart';
 import 'package:frostsnap/wallet_send_controllers.dart';
 import 'package:frostsnap/wallet_send_feerate_picker.dart';
+import 'package:frostsnap/wallet_send_sp_approval.dart';
 import 'package:frostsnap/wallet_tx_details.dart';
 
 enum SendPageIndex { recipient, amount, signers }
@@ -664,7 +665,34 @@ class _WalletSendPageState extends State<WalletSendPage> {
     final access = walletCtx.wallet.frostKey()!.accessStructures()[0];
     final now = DateTime.now();
 
-    final txDetails = TxDetailsModel(tx: unsignedTx.details(), now: now);
+    TxNeedsSignatures signingParams = StartSigning(
+      accessStructureRef: access.accessStructureRef(),
+      unsignedTx: unsignedTx,
+      devices: state.selectedSigners().toList(),
+    );
+    if (unsignedTx.hasSilentPaymentOutputs()) {
+      // The devices contribute their ECDH shares first. Signing then opens with the ones that
+      // did, on the session's transaction, which is the one with the silent payment scripts.
+      final signSessionId = await showSilentPaymentApproval(
+        context,
+        accessStructureRef: access.accessStructureRef(),
+        unsignedTx: unsignedTx,
+        devices: state.selectedSigners().toList(),
+        threshold: access.threshold(),
+      );
+      if (signSessionId == null || !context.mounted) return;
+      final restored = RestoreSigning.of(
+        sessionId: signSessionId,
+        masterAppkey: walletCtx.masterAppkey,
+      );
+      if (restored == null) return;
+      signingParams = restored;
+    }
+
+    final txDetails = TxDetailsModel(
+      tx: signingParams.unsignedTx.details(),
+      now: now,
+    );
     nextPageOrPop(null);
     await showBottomSheetOrDialog(
       context,
@@ -674,11 +702,7 @@ class _WalletSendPageState extends State<WalletSendPage> {
           txStates: walletCtx.txStream,
           txDetails: txDetails,
           psbtMan: fsCtx.psbtManager,
-          signingParams: StartSigning(
-            accessStructureRef: access.accessStructureRef(),
-            unsignedTx: unsignedTx,
-            devices: state.selectedSigners().toList(),
-          ),
+          signingParams: signingParams,
         ),
       ),
     );
