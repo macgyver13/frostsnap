@@ -238,12 +238,27 @@ class _WalletSendPageState extends State<WalletSendPage> {
               leading: completedCardLabel(context, 'Recipient'),
               title: Text(
                 // addressModel.formattedAddress,
-                spacedHex(recipient?.address?.toString() ?? '', groupSize: 4),
+                spacedHex(
+                  recipient?.silentPaymentAddress ??
+                      recipient?.address?.toString() ??
+                      '',
+                  groupSize: 4,
+                ),
                 textWidthBasis: TextWidthBasis.longestLine,
                 textAlign: TextAlign.right,
                 style: monospaceTextStyle,
               ),
               subtitle: switch (ownedRecipientLabel) {
+                null when recipient?.isSilentPayment() ?? false => Padding(
+                  padding: const EdgeInsets.only(top: 4.0),
+                  child: Text(
+                    'Silent payment',
+                    textAlign: TextAlign.right,
+                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
                 null => null,
                 final label => Padding(
                   padding: const EdgeInsets.only(top: 4.0),
