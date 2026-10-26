@@ -1,5 +1,5 @@
 use crate::{
-    address_display::AddressDisplay,
+    address_display::{pick_highlights, AddressDisplay},
     any_of::AnyOf,
     bitcoin_amount_display::BitcoinAmountDisplay,
     gray4_style::Gray4TextStyle,
@@ -9,7 +9,12 @@ use crate::{
     widget_list::{WidgetList, WidgetListItem},
     GrayToAlpha, HoldToConfirm, Image,
 };
-use alloc::{boxed::Box, format, string::ToString};
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 use embedded_graphics::{
     geometry::Size,
     pixelcolor::{Gray8, Rgb565},
@@ -20,6 +25,7 @@ use frostsnap_core::{
 };
 use frostsnap_fonts::{
     Gray4Font, NOTO_SANS_17_REGULAR, NOTO_SANS_18_LIGHT, NOTO_SANS_18_MEDIUM, NOTO_SANS_24_BOLD,
+    NOTO_SANS_MONO_15_REGULAR,
 };
 use tinybmp::Bmp;
 
@@ -29,6 +35,8 @@ const FONT_CONFIRM_TEXT: &Gray4Font = &NOTO_SANS_17_REGULAR;
 const FONT_CAUTION_NOTE: &Gray4Font = &NOTO_SANS_18_MEDIUM;
 const FONT_CAUTION_TITLE: &Gray4Font = &NOTO_SANS_24_BOLD;
 const FONT_CAUTION_TEXT: &Gray4Font = &NOTO_SANS_17_REGULAR;
+const FONT_SILENT_PAYMENT_ADDRESS: &Gray4Font = &NOTO_SANS_MONO_15_REGULAR;
+const SP_ADDRESS_HORIZONTAL_SPACING: u32 = 15;
 
 const HIGH_FEE_ABSOLUTE_THRESHOLD_SATS: u64 = 100_000;
 const HIGH_FEE_PERCENTAGE_THRESHOLD: u64 = 5;
@@ -178,6 +186,74 @@ impl UnrecognizedScriptPage {
         column.set_uniform_gap(10);
         Self {
             center: Center::new(column),
+        }
+    }
+}
+
+fn chunk_silent_payment_address(address: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut pos = 0;
+    while pos < address.len() {
+        let end = (pos + 4).min(address.len());
+        chunks.push(format!("{:4}", &address[pos..end]));
+        pos = end;
+    }
+    chunks
+}
+
+type SilentPaymentAddressDisplay = Column<Vec<Row<Vec<Text<Gray4TextStyle>>>>>;
+
+/// A silent payment recipient's address, in groups of four with a few highlighted, like
+/// [`AddressPage`]. A silent payment address is too long for `AddressDisplay`'s layout, so it
+/// gets a smaller monospace font. The output's script is derived from this address and the
+/// inputs, so the address is what the user checks.
+#[derive(Clone, frostsnap_macros::Widget)]
+pub struct SilentPaymentAddressPage {
+    #[widget_delegate]
+    center: Center<Padding<Column<(Text<Gray4TextStyle>, SilentPaymentAddressDisplay)>>>,
+}
+
+impl SilentPaymentAddressPage {
+    #[inline(never)]
+    pub fn new_with_seed(index: usize, address: &str, rand_seed: u32) -> Self {
+        let title = Text::new(
+            format!("To Silent Payment #{}", index + 1),
+            Gray4TextStyle::new(FONT_PAGE_HEADER, PALETTE.text_secondary),
+        );
+
+        let chunks = chunk_silent_payment_address(address);
+        let mixed_seed = rand_seed.wrapping_add((index as u32).wrapping_mul(0x9e3779b9));
+        let highlighted = pick_highlights(mixed_seed, chunks.len());
+
+        let mut rows = Vec::new();
+        for (row_idx, chunk_slice) in chunks.chunks(3).enumerate() {
+            let mut row_texts = Vec::new();
+            for (col_idx, chunk_str) in chunk_slice.iter().enumerate() {
+                let color = if highlighted.contains(&(row_idx * 3 + col_idx)) {
+                    PALETTE.on_background
+                } else {
+                    PALETTE.primary
+                };
+                row_texts.push(Text::new(
+                    chunk_str.clone(),
+                    Gray4TextStyle::new(FONT_SILENT_PAYMENT_ADDRESS, color),
+                ));
+            }
+            let mut row = Row::new(row_texts).with_main_axis_alignment(MainAxisAlignment::Center);
+            row.set_uniform_gap(SP_ADDRESS_HORIZONTAL_SPACING);
+            rows.push(row);
+        }
+        let mut address_col = Column::new(rows);
+        address_col.set_uniform_gap(1);
+
+        let mut column = Column::new((title, address_col))
+            .with_main_axis_alignment(MainAxisAlignment::Start)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center);
+        column.set_gap(0, 10);
+        let padded = Padding::only(column).bottom(30).build();
+
+        Self {
+            center: Center::new(padded),
         }
     }
 }
@@ -371,6 +447,7 @@ type SignPromptPage = AnyOf<(
     AmountPage,
     AddressPage,
     UnrecognizedScriptPage,
+    SilentPaymentAddressPage,
     FeePage,
     WarningPage,
     ConfirmationPage,
@@ -452,6 +529,14 @@ impl WidgetList for SignPromptPageList {
                     ),
                     PromptDestination::UnrecognizedScript(_) => (
                         SignPromptPage::new(UnrecognizedScriptPage::new(recipient_idx)),
+                        true,
+                    ),
+                    PromptDestination::SilentPayment(address) => (
+                        SignPromptPage::new(SilentPaymentAddressPage::new_with_seed(
+                            recipient_idx,
+                            address,
+                            self.rand_seed,
+                        )),
                         true,
                     ),
                 }
