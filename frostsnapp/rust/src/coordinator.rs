@@ -3,6 +3,7 @@ use crate::api;
 use crate::api::backup_run::{BackupDevice, BackupRun};
 use crate::api::coordinator::KeyState;
 use crate::api::device_list::DeviceListUpdate;
+use crate::api::signing::SpContactEntry;
 use crate::device_list::DeviceList;
 use crate::frb_generated::StreamSink;
 use anyhow::{anyhow, Result};
@@ -20,6 +21,7 @@ use frostsnap_coordinator::frostsnap_persist::DeviceNames;
 use frostsnap_coordinator::nonce_replenish::NonceReplenishState;
 use frostsnap_coordinator::persist::Persisted;
 use frostsnap_coordinator::signing::SigningState;
+use frostsnap_coordinator::sp_contact::{SpContactDispatcher, SpContactState};
 use frostsnap_coordinator::verify_address::{VerifyAddressProtocol, VerifyAddressProtocolState};
 use frostsnap_coordinator::wait_for_single_device::{
     WaitForSingleDevice, WaitForSingleDeviceState,
@@ -38,6 +40,8 @@ use frostsnap_core::coordinator::{
     NonceReplenishRequest, ParticipantBinonces, ParticipantSignatureShares, SendFinalizeKeygen,
 };
 use frostsnap_core::device::KeyPurpose;
+use frostsnap_core::message::signing::SpContactSessionId;
+use frostsnap_core::silent_payments::{SilentPaymentRecipient, SpContactDetails};
 use frostsnap_core::{
     message, schnorr_fun::frost::ShareIndex, AccessStructureRef, DeviceId, KeyId, KeygenId,
     RestorationId, SignSessionId, SymmetricKey, WireSignTask,
@@ -98,7 +102,11 @@ impl FfiCoordinator {
         let mut db_ = db.lock().unwrap();
 
         event!(Level::DEBUG, "loading core coordinator");
-        let coordinator = Persisted::<FrostCoordinator>::new(&mut db_, ())?;
+        let mut coordinator = Persisted::<FrostCoordinator>::new(&mut db_, ())?;
+        coordinator.staged_mutate(&mut db_, |coordinator| {
+            coordinator.settle_sp_contact_sessions();
+            Ok(())
+        })?;
         event!(Level::DEBUG, "loading device names");
         let device_names = Persisted::<DeviceNames>::new(&mut db_, ())?;
         event!(Level::DEBUG, "loading backup state");
@@ -244,6 +252,10 @@ impl FfiCoordinator {
                                 }
                             }
                             DeviceChange::Disconnected { id } => {
+                                // Contact shares are in memory and never persisted.
+                                coordinator
+                                    .MUTATE_NO_PERSIST()
+                                    .forget_sp_contact_shares_from(id);
                                 ui_stack.disconnected(id);
                             }
                             DeviceChange::NameChange { id, name } => {
@@ -500,6 +512,154 @@ impl FfiCoordinator {
         self.start_protocol(ui_protocol);
 
         Ok(())
+    }
+
+    /// Asks `devices` to confirm a contact and answer with their ECDH share. The devices connected
+    /// and ready now are asked at once; the caller asks the rest with
+    /// [`Self::request_sp_contact_ecdh`] when the state lists one in `connected_but_need_request`.
+    pub fn start_sp_contact(
+        &self,
+        access_structure_ref: AccessStructureRef,
+        name: String,
+        address: String,
+        devices: BTreeSet<DeviceId>,
+        encryption_key: SymmetricKey,
+        sink: impl Sink<SpContactState>,
+    ) -> anyhow::Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let mut coordinator = self.coordinator.lock().unwrap();
+        let network = coordinator
+            .iter_keys()
+            .find(|key| key.key_id == access_structure_ref.key_id)
+            .and_then(|key| key.purpose.bitcoin_network())
+            .ok_or(anyhow!("a contact needs a bitcoin wallet"))?;
+        // A scanned QR code often gives the address in uppercase.
+        let address = address.trim().to_lowercase();
+        let recipient = SilentPaymentRecipient::from_address(&address, network).ok_or(anyhow!(
+            "This is not a silent payment address on this network"
+        ))?;
+        let (session_id, sends) = coordinator.staged_mutate(&mut *db, |coordinator| {
+            Ok(coordinator.start_sp_contact(
+                access_structure_ref,
+                SpContactDetails { name, recipient },
+                &devices,
+                encryption_key,
+                &mut rand::thread_rng(),
+            )?)
+        })?;
+        drop(coordinator);
+        drop(db);
+
+        // Like `start_protocol`, but the requests already built go to the devices connected now,
+        // so the caller only has to ask the ones that connect later.
+        let mut ui_protocol = SpContactDispatcher::new(devices, session_id, sink);
+        for device in self.device_list.lock().unwrap().devices() {
+            ui_protocol.connected(device.id, device.device_mode());
+        }
+        for send in sends {
+            ui_protocol.send_request(send);
+        }
+        ui_protocol.emit_state();
+        self.ui_stack.lock().unwrap().push(ui_protocol);
+        Ok(())
+    }
+
+    /// Asks `device_id` for its ECDH share, including a device that disconnected and came back.
+    pub fn request_sp_contact_ecdh(
+        &self,
+        session_id: SpContactSessionId,
+        device_id: DeviceId,
+        encryption_key: SymmetricKey,
+    ) -> anyhow::Result<()> {
+        // Coordinator before the UI stack, the order the run loop takes them in.
+        let send = self.coordinator.lock().unwrap().request_sp_contact_ecdh(
+            session_id,
+            device_id,
+            encryption_key,
+        )?;
+        let mut ui_stack = self.ui_stack.lock().unwrap();
+        let dispatcher = ui_stack
+            .get_mut::<SpContactDispatcher>()
+            .filter(|dispatcher| dispatcher.session_id() == session_id)
+            .ok_or(anyhow!("this contact is no longer being added"))?;
+        dispatcher.send_request(send);
+        Ok(())
+    }
+
+    /// Opens signing from the devices that answered, once there are a threshold. The ECDH round
+    /// leaves the stack without clearing those devices, whose approvals the signing relies on.
+    pub fn start_sp_contact_sign(
+        &self,
+        session_id: SpContactSessionId,
+    ) -> anyhow::Result<SignSessionId> {
+        let sign_session_id = {
+            let mut db = self.db.lock().unwrap();
+            let mut coordinator = self.coordinator.lock().unwrap();
+            coordinator.staged_mutate(&mut *db, |coordinator| {
+                Ok(coordinator.start_sp_contact_sign(session_id, &mut rand::thread_rng())?)
+            })?
+        };
+        if let Some(dispatcher) = self
+            .ui_stack
+            .lock()
+            .unwrap()
+            .get_mut::<SpContactDispatcher>()
+            .filter(|dispatcher| dispatcher.session_id() == session_id)
+        {
+            dispatcher.finish();
+        }
+        Ok(sign_session_id)
+    }
+
+    /// Stores the contact a finished signing session signed.
+    pub fn finish_sp_contact(&self, session_id: SignSessionId) -> anyhow::Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let mut coordinator = self.coordinator.lock().unwrap();
+        coordinator.staged_mutate(&mut *db, |coordinator| {
+            coordinator
+                .finish_sp_contact(session_id)
+                .ok_or(anyhow!("that session did not sign a contact"))?;
+            Ok(())
+        })
+    }
+
+    /// Drops an ECDH round, discarding the shares collected so far.
+    pub fn cancel_sp_contact(&self, session_id: SpContactSessionId) -> anyhow::Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let mut coordinator = self.coordinator.lock().unwrap();
+        coordinator.staged_mutate(&mut *db, |coordinator| {
+            coordinator.cancel_sp_contact(session_id);
+            Ok(())
+        })
+    }
+
+    pub fn sp_contacts(&self, key_id: KeyId) -> Vec<SpContactEntry> {
+        let coordinator = self.coordinator.lock().unwrap();
+        let Some(network) = coordinator
+            .iter_keys()
+            .find(|key| key.key_id == key_id)
+            .and_then(|key| key.purpose.bitcoin_network())
+        else {
+            return vec![];
+        };
+        coordinator
+            .sp_contacts(key_id)
+            .filter_map(|contact| {
+                Some(SpContactEntry {
+                    address: contact.contact.details.recipient.address(network)?,
+                    contact: contact.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn remove_sp_contact(&self, key_id: KeyId, name: String) -> anyhow::Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let mut coordinator = self.coordinator.lock().unwrap();
+        coordinator.staged_mutate(&mut *db, |coordinator| {
+            coordinator.remove_sp_contact(key_id, name);
+            Ok(())
+        })
     }
 
     pub fn begin_upgrade_firmware(

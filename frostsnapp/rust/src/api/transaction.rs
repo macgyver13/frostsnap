@@ -4,6 +4,10 @@ use std::sync::{Arc, RwLock};
 
 use bitcoin::Address;
 use flutter_rust_bridge::frb;
+use frostsnap_coordinator::bitcoin::wallet::SendRecipient;
+use frostsnap_core::silent_payments::SilentPaymentRecipient;
+
+use super::signing::SpContactEntry;
 use frostsnap_core::{AccessStructureId, DeviceId, MasterAppkey};
 
 use crate::api::bitcoin::BitcoinNetworkExt;
@@ -104,13 +108,30 @@ impl AmountType {
 #[derive(Clone, Default)]
 pub struct Recipient {
     pub address: Option<Address>,
+    /// A trusted silent payment contact, set instead of `address`.
+    pub contact: Option<SpContactEntry>,
     pub amount: Option<AmountType>,
 }
 
 impl Recipient {
     #[frb(sync)]
     pub fn new(address: Option<Address>, amount: Option<AmountType>) -> Self {
-        Self { address, amount }
+        Self {
+            address,
+            contact: None,
+            amount,
+        }
+    }
+}
+
+/// Who `recipient` pays, or `None` if it has no address yet.
+fn send_recipient(recipient: &Recipient) -> Option<SendRecipient> {
+    match &recipient.contact {
+        Some(entry) => Some(SendRecipient::SilentPayment {
+            contact: Box::new(entry.contact.clone()),
+            address: entry.address.clone(),
+        }),
+        None => Some(SendRecipient::Address(recipient.address.clone()?)),
     }
 }
 
@@ -149,18 +170,18 @@ impl BuildTxInner {
         master_appkey: MasterAppkey,
         recipient: u32,
     ) -> Option<u64> {
-        Some(
-            super_wallet.calculate_available(
-                master_appkey,
-                self.recipients
-                    .iter()
-                    .skip(recipient.saturating_sub(1) as usize)
-                    .filter_map(|r| r.address.clone())
-                    .map(RustAutoOpaque::new)
-                    .collect(),
-                self.feerate()?,
-            ),
-        )
+        let recipients = self
+            .recipients
+            .iter()
+            .skip(recipient.saturating_sub(1) as usize)
+            .filter_map(send_recipient)
+            .collect::<Vec<_>>();
+        let available = super_wallet
+            .inner
+            .lock()
+            .unwrap()
+            .calculate_avaliable_value(master_appkey, recipients, self.feerate()?, true);
+        Some(available.max(0) as u64)
     }
 }
 
@@ -389,9 +410,9 @@ impl BuildTxState {
         sw.send_to(
             self.frost_key.master_appkey(),
             inner.recipients.iter().filter_map(|r| {
-                let addr = r.address.clone()?;
+                let to = send_recipient(r)?;
                 let amount = r.amount.map_or(Some(0), |a| a.value());
-                Some((addr, amount))
+                Some((to, amount))
             }),
             inner.feerate()?,
         )
@@ -399,8 +420,34 @@ impl BuildTxState {
         .fee()
     }
 
+    /// Pays the trusted contact `contact`.
+    #[frb(sync)]
+    pub fn set_recipient_contact(&self, recipient: u32, contact: &SpContactEntry) {
+        let mut inner = self.inner.write().unwrap();
+        let r = inner.get_or_create_recipient(recipient);
+        r.contact = Some(contact.clone());
+        r.address = None;
+        self._trigger_changed();
+    }
+
+    /// Whether `address` is a silent payment address on this wallet's network.
+    #[frb(sync)]
+    pub fn is_silent_payment_address(&self, address: &str) -> bool {
+        // A scanned QR code often gives the address in uppercase.
+        let address = address.trim().to_lowercase();
+        SilentPaymentRecipient::from_address(&address, self.super_wallet.network).is_some()
+    }
+
     #[frb(sync)]
     pub fn set_recipient_with_uri(&self, recipient: u32, uri: &str) -> Result<(), String> {
+        let uri = uri.trim();
+        if self.is_silent_payment_address(uri) {
+            return Err(
+                "Silent payments go to trusted contacts. Add this address as a contact first."
+                    .to_string(),
+            );
+        }
+
         let info = self
             .super_wallet
             .network
@@ -412,6 +459,7 @@ impl BuildTxState {
         let mut changed = false;
         if r.address.as_ref() != Some(&info.address) {
             r.address = Some(info.address);
+            r.contact = None;
             changed = true;
         }
         if r.amount != info.amount.map(AmountType::Value) {
@@ -446,6 +494,7 @@ impl BuildTxState {
         let r = inner.get_or_create_recipient(recipient);
         if r.address.as_ref() != Some(address) {
             r.address = Some(address.clone());
+            r.contact = None;
             self._trigger_changed();
         }
     }
@@ -456,10 +505,10 @@ impl BuildTxState {
             .try_into()
             .expect("recipient index must fit in usize");
         let mut inner = self.inner.write().unwrap();
-        let addr_opt = inner.recipients.get_mut(i).map(|r| &mut r.address);
-        if let Some(addr) = addr_opt {
-            if addr.is_some() {
-                *addr = None;
+        if let Some(r) = inner.recipients.get_mut(i) {
+            if r.address.is_some() || r.contact.is_some() {
+                r.address = None;
+                r.contact = None;
                 self._trigger_changed();
             }
         }
@@ -523,11 +572,11 @@ impl BuildTxState {
             }
         };
 
-        let addr = r
-            .and_then(|r| r.address.clone())
+        let to = r
+            .and_then(|r| send_recipient(&r))
             .ok_or(AmountError::UnspecifiedAddress)?;
 
-        let min_non_dust = addr.script_pubkey().minimal_non_dust().to_sat();
+        let min_non_dust = to.script_for_weight().minimal_non_dust().to_sat();
         if amount < min_non_dust {
             return Err(AmountError::AmountBelowDust { min_non_dust });
         }
@@ -576,7 +625,7 @@ impl BuildTxState {
         let recipients = inner
             .recipients
             .iter()
-            .filter_map(|r| Some((r.address.clone()?, r.amount?.value())))
+            .filter_map(|r| Some((send_recipient(r)?, r.amount?.value())))
             .collect::<Vec<_>>();
         if recipients.len() != inner.recipients.len() {
             return Err(TryFinishTxError::IncompleteRecipientValues);

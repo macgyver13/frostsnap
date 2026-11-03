@@ -25,6 +25,8 @@ use flutter_rust_bridge::frb;
 
 use frostsnap_coordinator::frostsnap_core;
 
+pub use frostsnap_core::message::signing::SpContactSessionId;
+
 pub use frostsnap_core::{
     device::KeyPurpose, message::EncodedSignature, AccessStructureId, AccessStructureRef, DeviceId,
     KeyId, KeygenId, MasterAppkey, RestorationId, SessionHash, SignSessionId, SymmetricKey,
@@ -227,6 +229,30 @@ pub struct _EncodedSignature(pub [u8; 64]);
 "
 )]
 pub struct _SignSessionId(pub [u8; 32]);
+
+#[frb(
+    mirror(SpContactSessionId),
+    non_hash,
+    non_eq,
+    dart_code = "
+  @override
+  int get hashCode => Object.hashAll(field0);
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is SpContactSessionId && _listEquals(field0, other.field0));
+
+  static bool _listEquals(List<int> a, List<int> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+"
+)]
+pub struct _SpContactSessionId(pub [u8; 32]);
 
 #[frb(mirror(AccessStructureRef))]
 pub struct _AccessStructureRef {

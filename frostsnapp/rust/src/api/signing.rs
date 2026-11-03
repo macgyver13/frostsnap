@@ -5,13 +5,14 @@ use super::{
 };
 use crate::api::broadcast::BehaviorBroadcast;
 use crate::frb_generated::StreamSink;
-use crate::sink_wrap::SinkWrap;
+use crate::sink_wrap::{report_start_failure, SinkWrap};
 use anyhow::{anyhow, Result};
 use bitcoin::hex::DisplayHex;
 use flutter_rust_bridge::frb;
 use frostsnap_coordinator::persist::Persisted;
 pub use frostsnap_coordinator::signing::SigningState;
 use frostsnap_coordinator::signing::{DispatcherCommand, SigningDispatcher};
+pub use frostsnap_coordinator::sp_contact::SpContactState;
 pub use frostsnap_core::bitcoin_transaction::TransactionTemplate;
 pub use frostsnap_core::coordinator::signing::RemoteSignSessionId;
 pub use frostsnap_core::coordinator::ActiveSignSession;
@@ -22,7 +23,9 @@ pub use frostsnap_core::coordinator::{
 use frostsnap_core::MasterAppkey;
 pub use frostsnap_core::WireSignTask;
 use frostsnap_core::{
-    message::EncodedSignature, AccessStructureRef, DeviceId, KeyId, SignSessionId, SymmetricKey,
+    message::{signing::SpContactSessionId, EncodedSignature},
+    silent_payments::SignedSpContact,
+    AccessStructureRef, DeviceId, KeyId, SignSessionId, SymmetricKey,
 };
 use frostsnap_macros::broadcast_handle;
 use rusqlite::Connection;
@@ -87,6 +90,34 @@ pub enum SigningDetails {
         content: String,
         hash_bytes: String,
     },
+}
+
+#[frb(mirror(SpContactState), unignore)]
+pub struct _SpContactState {
+    pub session_id: SpContactSessionId,
+    pub confirmed: Vec<DeviceId>,
+    pub needed_from: Vec<DeviceId>,
+    pub connected_but_need_request: Vec<DeviceId>,
+    pub aborted: Option<String>,
+}
+
+/// A trusted silent payment contact of a wallet.
+#[derive(Clone, Debug)]
+pub struct SpContactEntry {
+    pub(crate) contact: SignedSpContact,
+    pub(crate) address: String,
+}
+
+impl SpContactEntry {
+    #[frb(sync)]
+    pub fn name(&self) -> String {
+        self.contact.contact.details.name.clone()
+    }
+
+    #[frb(sync)]
+    pub fn address(&self) -> String {
+        self.address.clone()
+    }
 }
 
 #[frb(mirror(SigningState), unignore)]
@@ -857,6 +888,65 @@ impl Coordinator {
                 !canonical_txids.contains(&txid)
             })
             .collect()
+    }
+
+    /// Starts adding a contact: each of `devices` shows its name and address, and answers with its
+    /// share of the ECDH once the user holds. Once a threshold have,
+    /// [`Self::start_sp_contact_sign`] opens the session that signs it.
+    pub fn start_sp_contact(
+        &self,
+        access_structure_ref: AccessStructureRef,
+        name: String,
+        address: String,
+        devices: Vec<DeviceId>,
+        encryption_key: SymmetricKey,
+        sink: StreamSink<SpContactState>,
+    ) -> Result<()> {
+        report_start_failure(sink, |sink| {
+            self.0.start_sp_contact(
+                access_structure_ref,
+                name,
+                address,
+                devices.into_iter().collect(),
+                encryption_key,
+                sink,
+            )
+        })
+    }
+
+    #[frb(sync)]
+    pub fn request_sp_contact_ecdh(
+        &self,
+        session_id: SpContactSessionId,
+        device_id: DeviceId,
+        encryption_key: SymmetricKey,
+    ) -> Result<()> {
+        self.0
+            .request_sp_contact_ecdh(session_id, device_id, encryption_key)
+    }
+
+    /// Opens signing with the devices that answered. The session is followed like any other,
+    /// through [`Self::try_restore_signing_session`], and ends with [`Self::finish_sp_contact`].
+    pub fn start_sp_contact_sign(&self, session_id: SpContactSessionId) -> Result<SignSessionId> {
+        self.0.start_sp_contact_sign(session_id)
+    }
+
+    pub fn finish_sp_contact(&self, session_id: SignSessionId) -> Result<()> {
+        self.0.finish_sp_contact(session_id)
+    }
+
+    pub fn cancel_sp_contact(&self, session_id: SpContactSessionId) -> Result<()> {
+        self.0.cancel_sp_contact(session_id)
+    }
+
+    /// The trusted contacts of `key_id`, by name.
+    #[frb(sync)]
+    pub fn sp_contacts(&self, key_id: KeyId) -> Vec<SpContactEntry> {
+        self.0.sp_contacts(key_id)
+    }
+
+    pub fn remove_sp_contact(&self, key_id: KeyId, name: String) -> Result<()> {
+        self.0.remove_sp_contact(key_id, name)
     }
 
     pub fn cancel_sign_session(&self, ssid: SignSessionId) -> Result<()> {
