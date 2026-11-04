@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use alloc::{boxed::Box, collections::BTreeMap};
+use alloc::{boxed::Box, collections::BTreeMap, string::String};
 use bitcoin::{
     consensus::Encodable,
     hashes::{sha256d, Hash},
@@ -9,6 +9,7 @@ use bitcoin::{
 };
 
 use crate::{
+    silent_payments::{SignedSpContact, SilentPaymentRecipient},
     tweak::{AppTweak, BitcoinBip32Path},
     MasterAppkey,
 };
@@ -21,7 +22,7 @@ pub struct TransactionTemplate {
     #[bincode(with_serde)]
     lock_time: bitcoin::absolute::LockTime,
     inputs: Vec<Input>,
-    outputs: Vec<Output>,
+    pub(crate) outputs: Vec<Output>,
 }
 
 pub struct PushInput<'a> {
@@ -316,28 +317,60 @@ impl TransactionTemplate {
         // Calculate fee rate in sats/vB
         let fee_rate_sats_per_vbyte = self.feerate();
 
+        // A contact's script is derived from its signed record, so the contact is what the
+        // signer is shown. The sign task check has bound the address to its keys.
+        let silent_payment_recipients = self
+            .outputs
+            .iter()
+            .filter_map(|output| match &output.owner {
+                SpkOwner::SilentPayment(sp) => Some(PromptContact {
+                    name: sp.contact.contact.details.name.clone(),
+                    address: sp.address.clone(),
+                    amount: bitcoin::Amount::from_sat(output.value),
+                }),
+                _ => None,
+            })
+            .collect();
+
         PromptSignBitcoinTx {
             foreign_recipients,
+            silent_payment_recipients,
             fee,
             fee_rate_sats_per_vbyte,
         }
     }
 }
 
+/// A trusted silent payment contact a send pays.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PromptContact {
+    pub name: String,
+    pub address: String,
+    pub amount: bitcoin::Amount,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PromptSignBitcoinTx {
     pub foreign_recipients: Vec<(bitcoin::Address, bitcoin::Amount)>,
+    /// Silent payment contacts, by name and the address the device has checked against the
+    /// contact's keys.
+    pub silent_payment_recipients: Vec<PromptContact>,
     pub fee: bitcoin::Amount,
     /// Fee rate in sats/vB
     pub fee_rate_sats_per_vbyte: Option<f64>,
 }
 
 impl PromptSignBitcoinTx {
-    /// Calculate the total amount being sent to foreign recipients
+    /// Calculate the total amount being sent to foreign and silent payment recipients
     pub fn total_sent(&self) -> bitcoin::Amount {
         self.foreign_recipients
             .iter()
             .map(|(_, amount)| *amount)
+            .chain(
+                self.silent_payment_recipients
+                    .iter()
+                    .map(|contact| contact.amount),
+            )
             .sum()
     }
 }
@@ -439,6 +472,32 @@ impl Output {
 pub enum SpkOwner {
     Foreign(#[bincode(with_serde)] ScriptBuf),
     Local(LocalSpk),
+    SilentPayment(Box<SilentPaymentOutput>),
+}
+
+/// A silent payment output. Its script depends on the ECDH shares of the signing devices, so it
+/// is `None` until they are combined. A send with any output still missing its script cannot be
+/// signed.
+#[derive(bincode::Encode, bincode::Decode, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SilentPaymentOutput {
+    /// The trusted contact this pays, with the wallet's signature over it.
+    pub contact: SignedSpContact,
+    /// The contact's address, for display. Must encode the contact's keys on the signing network.
+    pub address: String,
+    #[bincode(with_serde)]
+    pub script: Option<ScriptBuf>,
+}
+
+impl SilentPaymentOutput {
+    pub fn recipient(&self) -> SilentPaymentRecipient {
+        self.contact.contact.details.recipient
+    }
+
+    /// A P2TR script with a zero key: the weight and dust limit of a silent payment output whose
+    /// script has yet to be derived.
+    pub fn placeholder_script() -> ScriptBuf {
+        ScriptBuf::from_bytes([&[0x51, 0x20][..], &[0u8; 32][..]].concat())
+    }
 }
 
 impl SpkOwner {
@@ -446,25 +505,35 @@ impl SpkOwner {
         match self {
             SpkOwner::Foreign(spk) => RootOwner::Foreign(spk.clone()),
             SpkOwner::Local(local) => RootOwner::Local(local.master_appkey),
+            SpkOwner::SilentPayment(_) => RootOwner::Foreign(self.spk()),
         }
     }
     pub fn spk(&self) -> ScriptBuf {
         match self {
             SpkOwner::Foreign(spk) => spk.clone(),
             SpkOwner::Local(owner) => owner.spk(),
+            // WireSignTask::check refuses a send whose silent payment scripts are not the ones
+            // its contacts derive. Until they are filled in, the placeholder keeps the weight, and
+            // so the fee rate, of the final send.
+            // TODO: size unfilled outputs from a constant P2TR weight and dust limit and make
+            // spk() return Option, so txid() and sighashes can't be taken from a placeholder.
+            SpkOwner::SilentPayment(sp) => sp
+                .script
+                .clone()
+                .unwrap_or_else(SilentPaymentOutput::placeholder_script),
         }
     }
 
     pub fn local_owner_key(&self) -> Option<MasterAppkey> {
         match self {
-            SpkOwner::Foreign(_) => None,
+            SpkOwner::Foreign(_) | SpkOwner::SilentPayment(_) => None,
             SpkOwner::Local(owner) => Some(owner.master_appkey),
         }
     }
 
     pub fn local_owner(&self) -> Option<&LocalSpk> {
         match self {
-            SpkOwner::Foreign(_) => None,
+            SpkOwner::Foreign(_) | SpkOwner::SilentPayment(_) => None,
             SpkOwner::Local(owner) => Some(owner),
         }
     }

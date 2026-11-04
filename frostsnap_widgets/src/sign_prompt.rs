@@ -376,7 +376,8 @@ type SignPromptPage = AnyOf<(
 
 impl SignPromptPageList {
     fn new_with_seed(prompt: PromptSignBitcoinTx, rand_seed: u32) -> Self {
-        let num_recipients = prompt.foreign_recipients.len();
+        let num_recipients =
+            prompt.foreign_recipients.len() + prompt.silent_payment_recipients.len();
         let has_warning = Self::has_high_fee(&prompt);
 
         let total_pages = num_recipients * 2 + 1 + if has_warning { 1 } else { 0 } + 1;
@@ -395,11 +396,7 @@ impl SignPromptPageList {
             return true;
         }
 
-        let total_sent: u64 = prompt
-            .foreign_recipients
-            .iter()
-            .map(|(_, amount)| amount.to_sat())
-            .sum();
+        let total_sent = prompt.total_sent().to_sat();
         if total_sent > 0 && fee_sats > total_sent * HIGH_FEE_PERCENTAGE_THRESHOLD / 100 {
             return true;
         }
@@ -420,7 +417,8 @@ impl WidgetList for SignPromptPageList {
             return None;
         }
 
-        let num_recipients = self.prompt.foreign_recipients.len();
+        let num_recipients =
+            self.prompt.foreign_recipients.len() + self.prompt.silent_payment_recipients.len();
         let recipient_pages = num_recipients * 2;
         let has_warning = Self::has_high_fee(&self.prompt);
 
@@ -429,29 +427,49 @@ impl WidgetList for SignPromptPageList {
             let is_amount = index.is_multiple_of(2);
 
             if is_amount {
-                let (_, amount) = &self.prompt.foreign_recipients[recipient_idx];
+                let amount = self
+                    .prompt
+                    .foreign_recipients
+                    .as_slice()
+                    .get(recipient_idx)
+                    .map(|(_, amount)| amount)
+                    .unwrap_or_else(|| {
+                        &self.prompt.silent_payment_recipients
+                            [recipient_idx - self.prompt.foreign_recipients.len()]
+                        .amount
+                    });
                 (
                     SignPromptPage::new(AmountPage::new(recipient_idx, amount.to_sat())),
                     false,
                 )
             } else {
-                let (address, _) = &self.prompt.foreign_recipients[recipient_idx];
-                (
-                    SignPromptPage::new(AddressPage::new_with_seed(
-                        recipient_idx,
-                        address,
-                        self.rand_seed,
-                    )),
-                    true,
-                )
+                if let Some((address, _)) =
+                    self.prompt.foreign_recipients.as_slice().get(recipient_idx)
+                {
+                    (
+                        SignPromptPage::new(AddressPage::new_with_seed(
+                            recipient_idx,
+                            address,
+                            self.rand_seed,
+                        )),
+                        true,
+                    )
+                } else {
+                    let contact = &self.prompt.silent_payment_recipients
+                        [recipient_idx - self.prompt.foreign_recipients.len()];
+                    (
+                        SignPromptPage::new(SilentPaymentAddressPage::new_with_seed(
+                            recipient_idx,
+                            format!("To {}", contact.name),
+                            &contact.address,
+                            self.rand_seed,
+                        )),
+                        true,
+                    )
+                }
             }
         } else if has_warning && index == recipient_pages {
-            let total_sent: u64 = self
-                .prompt
-                .foreign_recipients
-                .iter()
-                .map(|(_, amount)| amount.to_sat())
-                .sum();
+            let total_sent = self.prompt.total_sent().to_sat();
             (
                 SignPromptPage::new(WarningPage::new(self.prompt.fee.to_sat(), total_sent)),
                 false,

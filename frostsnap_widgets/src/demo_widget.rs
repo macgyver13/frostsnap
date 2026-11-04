@@ -466,6 +466,15 @@ macro_rules! demo_widget {
                         (p2sh_address, bitcoin::Amount::from_sat(400_000)),   // 0.004 BTC
                         (p2pkh_address, bitcoin::Amount::from_sat(500_000)),  // 0.005 BTC
                     ],
+                    // BIP352's example address. Its script is derived on signing, so the
+                    // device shows the address the recipient gave.
+                    silent_payment_recipients: $crate::alloc::vec![
+                        frostsnap_core::bitcoin_transaction::PromptContact {
+                            name: "Alice".into(),
+                            address: "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv".into(),
+                            amount: bitcoin::Amount::from_sat(250_000),
+                        },
+                    ],
                     fee: bitcoin::Amount::from_sat(80_000), // 0.00080 BTC (>5% fee triggers warning)
                     fee_rate_sats_per_vbyte: Some(12.5), // Example: 12.5 sats/vB fee rate
                 };
