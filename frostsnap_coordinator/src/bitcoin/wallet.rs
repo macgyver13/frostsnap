@@ -15,7 +15,8 @@ use frostsnap_core::{
     MasterAppkey,
 };
 use frostsnap_core::{
-    bitcoin_transaction::{PushInput, TransactionTemplate},
+    bitcoin_transaction::{PushInput, SilentPaymentOutput, TransactionTemplate},
+    silent_payments::SignedSpContact,
     tweak::BitcoinAccount,
 };
 use std::{
@@ -32,6 +33,34 @@ pub type WalletIndexedTxGraph =
     indexed_tx_graph::IndexedTxGraph<ConfirmationBlockTime, WalletIndexer>;
 pub type WalletIndexedTxGraphChangeSet =
     indexed_tx_graph::ChangeSet<ConfirmationBlockTime, keychain_txout::ChangeSet>;
+
+/// A recipient of a send: an ordinary address, or a trusted silent payment contact with its
+/// address, which the signing devices display.
+#[derive(Clone, Debug)]
+pub enum SendRecipient {
+    Address(bitcoin::Address),
+    SilentPayment {
+        contact: Box<SignedSpContact>,
+        address: String,
+    },
+}
+
+impl From<bitcoin::Address> for SendRecipient {
+    fn from(address: bitcoin::Address) -> Self {
+        SendRecipient::Address(address)
+    }
+}
+
+impl SendRecipient {
+    /// The script used to size this recipient's output. A silent payment output's script depends
+    /// on the inputs, so it is sized by its placeholder.
+    pub fn script_for_weight(&self) -> ScriptBuf {
+        match self {
+            SendRecipient::Address(address) => address.script_pubkey(),
+            SendRecipient::SilentPayment { .. } => SilentPaymentOutput::placeholder_script(),
+        }
+    }
+}
 
 /// Wallet that manages all the frostsnap keys on the same network in a single transaction graph
 pub struct CoordSuperWallet {
@@ -453,10 +482,18 @@ impl CoordSuperWallet {
         self.chain_client.reconnect()
     }
 
+    /// Builds a transaction template paying `recipients`.
+    ///
+    /// The recipients are placed in the transaction in random order. Silent payment output scripts
+    /// look random on chain, but a recipient who lands at the same output index in every payment of
+    /// a recurring run (a monthly payroll, say) can still be followed by position. Shuffling
+    /// breaks that. It happens once, here, after the amounts are resolved and before any script is
+    /// derived, so the BIP352 `k` of each scan key is assigned from the shuffled order and the
+    /// template then carries that order to every party. The change output is not shuffled.
     pub fn send_to(
         &mut self,
         master_appkey: MasterAppkey,
-        recipients: impl IntoIterator<Item = (bitcoin::Address, Option<u64>)>,
+        recipients: impl IntoIterator<Item = (impl Into<SendRecipient>, Option<u64>)>,
         feerate: f32,
     ) -> Result<bitcoin_transaction::TransactionTemplate> {
         self.lazily_initialize_key(master_appkey);
@@ -464,18 +501,22 @@ impl CoordSuperWallet {
             metrics, Candidate, ChangePolicy, CoinSelector, DrainWeights, FeeRate, Target,
             TargetFee, TargetOutputs, TR_DUST_RELAY_MIN_VALUE, TR_KEYSPEND_TXIN_WEIGHT,
         };
+        use rand::seq::SliceRandom;
 
-        let recipients = recipients.into_iter().collect::<Vec<_>>();
+        let recipients = recipients
+            .into_iter()
+            .map(|(recipient, amount)| (recipient.into(), amount))
+            .collect::<Vec<(SendRecipient, _)>>();
 
-        let target_outputs = {
-            let mut target_outputs = Vec::<bitcoin::TxOut>::with_capacity(recipients.len());
+        let mut target_outputs = {
+            let mut target_outputs = Vec::<(SendRecipient, u64)>::with_capacity(recipients.len());
             let mut available_amount = self.calculate_avaliable_value(
                 master_appkey,
-                recipients.iter().map(|(addr, _)| addr.clone()),
+                recipients.iter().map(|(recipient, _)| recipient.clone()),
                 feerate,
                 true,
             );
-            for (i, (addr, amount_opt)) in recipients.iter().enumerate() {
+            for (i, (recipient, amount_opt)) in recipients.iter().enumerate() {
                 let amount: u64 = match amount_opt {
                     Some(amount) => *amount,
                     None => available_amount
@@ -490,13 +531,13 @@ impl CoordSuperWallet {
                         "Insufficient balance: {available_amount}sats left for recipient {i}"
                     ));
                 }
-                target_outputs.push(TxOut {
-                    value: Amount::from_sat(amount),
-                    script_pubkey: addr.script_pubkey(),
-                });
+                target_outputs.push((recipient.clone(), amount));
             }
             target_outputs
         };
+        // Amounts are order dependent (a recipient without one takes what is left) so this has to
+        // come after they are resolved.
+        target_outputs.shuffle(&mut rand::thread_rng());
 
         let utxos: Vec<(_, bdk_chain::FullTxOut<_>)> = self
             .tx_graph
@@ -523,11 +564,15 @@ impl CoordSuperWallet {
 
         let target = Target {
             fee: TargetFee::from_feerate(FeeRate::from_sat_per_vb(feerate)),
-            outputs: TargetOutputs::fund_outputs(
-                target_outputs
-                    .iter()
-                    .map(|txo| (txo.weight().to_wu(), txo.value.to_sat())),
-            ),
+            outputs: TargetOutputs::fund_outputs(target_outputs.iter().map(
+                |(recipient, value)| {
+                    let txo = TxOut {
+                        value: Amount::from_sat(*value),
+                        script_pubkey: recipient.script_for_weight(),
+                    };
+                    (txo.weight().to_wu(), *value)
+                },
+            )),
         };
 
         // we try and guess the usual feerate from the existing transactions in the graph This is
@@ -632,17 +677,29 @@ impl CoordSuperWallet {
             );
         }
 
-        for txo in target_outputs {
-            template_tx.push_foreign_output(txo);
+        for (recipient, value) in target_outputs {
+            match recipient {
+                SendRecipient::Address(address) => template_tx.push_foreign_output(TxOut {
+                    value: Amount::from_sat(value),
+                    script_pubkey: address.script_pubkey(),
+                }),
+                SendRecipient::SilentPayment { contact, address } => template_tx
+                    .push_silent_payment_output(Amount::from_sat(value), *contact, address),
+            }
         }
 
-        Ok(template_tx)
+        if !template_tx.has_silent_payment_outputs() {
+            return Ok(template_tx);
+        }
+        template_tx
+            .with_contact_sp_scripts(master_appkey)
+            .ok_or_else(|| anyhow!("couldn't derive the silent payment scripts"))
     }
 
     pub fn calculate_avaliable_value(
         &mut self,
         master_appkey: MasterAppkey,
-        target_addresses: impl IntoIterator<Item = bitcoin::Address>,
+        target_recipients: impl IntoIterator<Item = impl Into<SendRecipient>>,
         feerate: f32,
         effective_only: bool,
     ) -> i64 {
@@ -655,9 +712,9 @@ impl CoordSuperWallet {
         let feerate = FeeRate::from_sat_per_vb(feerate);
         let target = Target {
             fee: TargetFee::from_feerate(feerate),
-            outputs: TargetOutputs::fund_outputs(target_addresses.into_iter().map(|addr| {
+            outputs: TargetOutputs::fund_outputs(target_recipients.into_iter().map(|recipient| {
                 let txo = bitcoin::TxOut {
-                    script_pubkey: addr.script_pubkey(),
+                    script_pubkey: recipient.into().script_for_weight(),
                     value: Amount::ZERO,
                 };
                 (txo.weight().to_wu(), 0)
@@ -984,6 +1041,34 @@ mod test {
     use super::*;
     use bitcoin::key::{Secp256k1, TweakedPublicKey};
     use frostsnap_core::{schnorr_fun::fun::Point, tweak::AppTweak};
+
+    /// A contact is sized as the P2TR output it will become.
+    // TODO: test that send_to commits a contact with its script derived from the inputs. This
+    // branch's wallet has no funded send fixture to run it against.
+    #[test]
+    fn a_contact_is_sized_as_p2tr() {
+        use frostsnap_core::silent_payments::{
+            SilentPaymentRecipient, SpContact, SpContactDetails,
+        };
+        let key = Point::random(&mut rand::thread_rng());
+        let silent = SendRecipient::SilentPayment {
+            contact: Box::new(SignedSpContact {
+                contact: SpContact {
+                    details: SpContactDetails {
+                        name: "Alice".into(),
+                        recipient: SilentPaymentRecipient {
+                            scan_key: key,
+                            spend_key: key,
+                        },
+                    },
+                    account_ecdh: key,
+                },
+                signature: [0u8; 64],
+            }),
+            address: "sp1example".into(),
+        };
+        assert!(silent.script_for_weight().is_p2tr());
+    }
 
     #[test]
     fn wallet_descriptors_match_our_tweaking() {
