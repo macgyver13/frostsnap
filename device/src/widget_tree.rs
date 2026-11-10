@@ -1,6 +1,6 @@
 use alloc::boxed::Box;
 use frostsnap_core::{
-    device::{restoration::EnterBackupPhase, KeyGenPhase3, SignPhase1},
+    device::{restoration::EnterBackupPhase, KeyGenPhase3, SignPhase1, SpContactEcdhPhase},
     schnorr_fun::frost::ShareIndex,
     AccessStructureRef,
 };
@@ -8,7 +8,7 @@ use frostsnap_widgets::{
     backup::{BackupDisplay, CheckBackupScreen, EnterShareScreen},
     keygen_check::KeygenCheck,
     layout::*,
-    sign_prompt::SignTxPrompt,
+    sign_prompt::{SignTxPrompt, SpContactPrompt},
     DeviceNameScreen, EraseDevice, EraseProgress, FirmwareUpgradeConfirm, FirmwareUpgradeProgress,
     HoldToConfirm, SignMessageConfirm, Standby, Text,
 };
@@ -35,6 +35,12 @@ pub enum WidgetTree {
     SignTxPrompt {
         widget: Box<SignTxPrompt>,
         phase: Option<Box<SignPhase1>>,
+    },
+
+    /// Add a trusted silent payment contact prompt screen
+    SpContactPrompt {
+        widget: Box<SpContactPrompt>,
+        phase: Option<Box<SpContactEcdhPhase>>,
     },
 
     /// Sign test message prompt screen
@@ -94,6 +100,23 @@ pub enum WidgetTree {
         share_index: ShareIndex,
         fired: bool,
     },
+}
+
+impl WidgetTree {
+    // Keeping widget construction in a non-inlined constructor prevents its
+    // temporaries from inflating FrostyUi::set_workflow's checked stack frame.
+    #[inline(never)]
+    pub(crate) fn build_sp_contact_prompt(phase: Box<SpContactEcdhPhase>, rand_seed: u32) -> Self {
+        let widget = Box::new(SpContactPrompt::new(
+            phase.name().into(),
+            phase.address().into(),
+            rand_seed,
+        ));
+        Self::SpContactPrompt {
+            widget,
+            phase: Some(phase),
+        }
+    }
 }
 
 impl Default for WidgetTree {

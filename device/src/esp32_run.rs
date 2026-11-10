@@ -647,6 +647,14 @@ impl<'a> DeviceLoop<'a> {
                                     rand_seed,
                                 }));
                         }
+                        DeviceToUserMessage::SpContactEcdhRequest { phase } => {
+                            let rand_seed = self.rng.next_u32();
+                            self.ui
+                                .set_workflow(ui::Workflow::prompt(ui::Prompt::SpContact {
+                                    phase,
+                                    rand_seed,
+                                }));
+                        }
                         DeviceToUserMessage::Restoration(to_user_restoration) => {
                             use frostsnap_core::device::restoration::ToUserRestoration::*;
                             match *to_user_restoration {
@@ -746,6 +754,23 @@ impl<'a> DeviceLoop<'a> {
                         .send_to_coordinator([DeviceSendBody::SetName {
                             name: new_name.clone(),
                         }]);
+                }
+                UiEvent::SpContactConfirm { phase } => {
+                    self.ui.set_busy_task(ui::BusyTask::SpContact);
+                    // A share that fails to decrypt comes from a bad coordinator contribution, so
+                    // drop the request instead of panicking. The coordinator gets no answer.
+                    match self.signer.sp_contact_ecdh_ack(
+                        *phase,
+                        &mut self.hmac_keys.share_encryption,
+                        self.rng,
+                    ) {
+                        Ok(sends) => self.outbox.extend(sends),
+                        Err(_e) => {
+                            log_and_redraw!(self.ui, "sp contact ack failed: {_e:?}");
+                            self.ui.clear_busy_task();
+                            self.ui.go_to_default();
+                        }
+                    }
                 }
                 UiEvent::BackupRecorded => {
                     self.upstream_connection

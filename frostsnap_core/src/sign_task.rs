@@ -176,11 +176,16 @@ pub enum SignTaskError {
     WrongPurpose,
     InvalidBitcoinTransaction,
     NothingToSign,
+    SilentPaymentInvalidContactName,
 }
 
 impl core::fmt::Display for SignTaskError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            SignTaskError::SilentPaymentInvalidContactName => write!(
+                f,
+                "A contact name must be 1 to 20 printable ASCII characters"
+            ),
             SignTaskError::WrongKey { got, expected } => write!(
                 f,
                 "sign task was for key {expected} but got an item for key {got}",

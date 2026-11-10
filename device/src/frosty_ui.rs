@@ -296,6 +296,9 @@ impl<'a> UserInteraction for FrostyUi<'a> {
                             new_name: Some(new_name.clone()),
                         }
                     }
+                    Prompt::SpContact { phase, rand_seed } => {
+                        WidgetTree::build_sp_contact_prompt(phase, rand_seed)
+                    }
                     Prompt::EraseDevice => {
                         use frostsnap_widgets::EraseDevice;
 
@@ -444,6 +447,14 @@ impl<'a> UserInteraction for FrostyUi<'a> {
                     }
                 }
                 if phase.is_none() && sign_prompt.is_finished() {
+                    self.go_to_default();
+                }
+            }
+            WidgetTree::SpContactPrompt { widget, phase } => {
+                if let Some(phase_data) = phase.take_if(|_| widget.is_confirmed()) {
+                    return Some(UiEvent::SpContactConfirm { phase: phase_data });
+                }
+                if phase.is_none() && widget.is_finished() {
                     self.go_to_default();
                 }
             }
