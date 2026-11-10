@@ -10,6 +10,7 @@ pub mod nonce_replenish;
 pub mod remote_keygen;
 mod serial_port;
 pub mod signing;
+pub mod sp_contact;
 mod ui_protocol;
 mod usb_serial_manager;
 pub mod verify_address;
