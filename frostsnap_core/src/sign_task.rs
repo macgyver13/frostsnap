@@ -13,6 +13,7 @@ pub enum WireSignTask {
         event: Box<crate::nostr::UnsignedEvent>,
     },
     BitcoinTransaction(bitcoin_transaction::TransactionTemplate),
+    SpContact(Box<crate::silent_payments::SpContact>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +26,10 @@ pub enum SignTask {
     },
     BitcoinTransaction {
         tx_template: bitcoin_transaction::TransactionTemplate,
+        network: bitcoin::Network,
+    },
+    SpContact {
+        contact: Box<crate::silent_payments::SpContact>,
         network: bitcoin::Network,
     },
 }
@@ -89,6 +94,16 @@ impl WireSignTask {
                     network,
                 }
             }
+            WireSignTask::SpContact(contact) => {
+                let network = match purpose {
+                    KeyPurpose::Bitcoin(network) => network,
+                    _ => return Err(SignTaskError::WrongPurpose),
+                };
+                if !contact.details.has_valid_name() {
+                    return Err(SignTaskError::SilentPaymentInvalidContactName);
+                }
+                SignTask::SpContact { contact, network }
+            }
         };
         Ok(CheckedSignTask {
             master_appkey,
@@ -135,6 +150,7 @@ impl CheckedSignTask {
                     }
                 })
                 .collect(),
+            SignTask::SpContact { contact, network } => vec![contact.sign_item(*network)],
         }
     }
 }

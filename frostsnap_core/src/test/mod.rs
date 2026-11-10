@@ -215,6 +215,15 @@ pub trait Env {
                     .unwrap();
                 run.extend_from_device(from, ack);
             }
+            DeviceToUserMessage::SpContactSignRequest { phase } => {
+                let sign_ack = run.participants[ci]
+                    .devices
+                    .get_mut(&from)
+                    .unwrap()
+                    .sign_ack(*phase, &mut TestDeviceKeyGen)
+                    .unwrap();
+                run.extend_from_device(from, sign_ack);
+            }
             DeviceToUserMessage::Restoration(restoration) => {
                 use crate::device::restoration::ToUserRestoration::*;
                 if let ConsolidateBackup(phase) = *restoration {

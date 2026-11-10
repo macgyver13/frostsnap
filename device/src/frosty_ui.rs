@@ -247,7 +247,10 @@ impl<'a> UserInteraction for FrostyUi<'a> {
                                     phase: Some(phase),
                                 }
                             }
-                            frostsnap_core::SignTask::Nostr { .. } => {
+                            // A contact is never prompted for: it is signed on the user's
+                            // confirmation at its ECDH.
+                            frostsnap_core::SignTask::Nostr { .. }
+                            | frostsnap_core::SignTask::SpContact { .. } => {
                                 // Nostr signing not implemented yet
                                 let mut standby = Standby::new();
                                 standby.set_welcome();

@@ -569,6 +569,8 @@ impl FrostCoordinator {
                     coord_share_decryption_contrib,
                 },
             },
+            // A remote session never signs a contact.
+            sp_contact_proofs: None,
         })
     }
 
