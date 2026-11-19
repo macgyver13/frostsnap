@@ -12,9 +12,11 @@ import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
 import 'package:frostsnap/global.dart';
 import 'package:frostsnap/maybe_fullscreen_dialog.dart';
+import 'package:frostsnap/nostr_chat/contact_book.dart';
 import 'package:frostsnap/snackbar.dart';
 import 'package:frostsnap/src/rust/api.dart';
 import 'package:frostsnap/src/rust/api/nostr.dart';
+import 'package:frostsnap/src/rust/api/nostr/contacts.dart';
 import 'package:frostsnap/src/rust/api/signing.dart';
 import 'package:frostsnap/src/rust/api/super_wallet.dart';
 import 'package:frostsnap/src/rust/api/transaction.dart';
@@ -33,6 +35,10 @@ class WalletSendPage extends StatefulWidget {
   final ScrollController? scrollController;
   final void Function(UnsignedTx, List<DeviceId>)? onTxReady;
   final bool remoteSigning;
+
+  /// The wallet's shared contact book, on a wallet coordinated over nostr. An imported file may
+  /// then name new contacts, which the group adds before the send.
+  final ChannelContacts? contacts;
   const WalletSendPage({
     super.key,
     required this.superWallet,
@@ -41,6 +47,7 @@ class WalletSendPage extends StatefulWidget {
     this.scrollController,
     this.onTxReady,
     this.remoteSigning = false,
+    this.contacts,
   });
 
   BuildTxState buildTx() {
@@ -1060,13 +1067,14 @@ class _WalletSendPageState extends State<WalletSendPage> {
       return;
     }
 
+    final channel = widget.contacts;
     List<RecipientLine> lines;
     try {
       lines = parseRecipientsFile(
         contents: contents,
         network: widget.superWallet.network,
         contacts: coord.spContacts(keyId: _contactsRef.keyId),
-        allowNewContacts: false,
+        allowNewContacts: channel != null,
       );
     } catch (e) {
       if (context.mounted) {
@@ -1076,6 +1084,43 @@ class _WalletSendPageState extends State<WalletSendPage> {
     }
 
     if (!context.mounted) return;
+
+    // Silent payment lines that are not contacts yet, each address once.
+    final newContacts = <String, ContactChangeView>{};
+    for (final line in lines) {
+      if (!line.isSilentPayment || line.contact != null) continue;
+      newContacts.putIfAbsent(
+        line.address.toLowerCase(),
+        () => ContactChangeView(
+          remove: false,
+          name: line.label!,
+          address: line.address,
+        ),
+      );
+    }
+    if (channel != null && newContacts.isNotEmpty) {
+      final added = await _addNewContacts(
+        context,
+        channel,
+        newContacts.values.toList(),
+      );
+      if (!added || !context.mounted) return;
+      // Every line resolves to a contact now, through the same checks.
+      try {
+        lines = parseRecipientsFile(
+          contents: contents,
+          network: widget.superWallet.network,
+          contacts: coord.spContacts(keyId: _contactsRef.keyId),
+          allowNewContacts: false,
+        );
+      } catch (e) {
+        if (context.mounted) {
+          await _showErrorDialog(context, e.toString());
+        }
+        return;
+      }
+      if (!context.mounted) return;
+    }
 
     try {
       state.setRecipients(lines: lines);
@@ -1101,6 +1146,64 @@ class _WalletSendPageState extends State<WalletSendPage> {
       pageIndex = SendPageIndex.signers;
     });
     scrollToTop();
+  }
+
+  /// Shows the new contacts a file names and asks the group to add them in one change set.
+  /// Whether the book has them now.
+  Future<bool> _addNewContacts(
+    BuildContext context,
+    ChannelContacts channel,
+    List<ContactChangeView> adds,
+  ) async {
+    if (channel.state.value?.book.syncing ?? true) {
+      await _showErrorDialog(
+        context,
+        'This file pays new contacts, and contacts are still syncing with the group. '
+        'Import it again once they have synced.',
+      );
+      return false;
+    }
+    final ask = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(
+          adds.length == 1 ? '1 new contact' : '${adds.length} new contacts',
+        ),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'These silent payment addresses are not contacts yet. The group adds them, '
+                'named by their labels, before the send. Every member confirms them on a '
+                'device, so check each name and address against your own records.',
+              ),
+              for (final add in adds) ContactChangeTile(change: add),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Ask the group'),
+          ),
+        ],
+      ),
+    );
+    if (ask != true || !context.mounted) return false;
+    final added = await channel.askGroup(context, adds);
+    if (!added && context.mounted) {
+      showErrorSnackbar(
+        context,
+        'The send continues once the group has added the contacts. Import the file again then.',
+      );
+    }
+    return added;
   }
 
   Future<void> _showErrorDialog(BuildContext context, String message) async {

@@ -1748,6 +1748,7 @@ class _ChatPageBodyState extends State<ChatPageBody> {
           masterAppkey: walletCtx.masterAppkey,
           scrollController: scrollController,
           remoteSigning: true,
+          contacts: _contacts,
           onTxReady: (unsignedTx, selectedDevices) {
             setState(() {
               _pendingSignRequest = null;
