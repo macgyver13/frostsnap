@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart' hide ConnectionState;
 import 'package:flutter/services.dart';
 import 'package:frostsnap/copy_feedback.dart';
+import 'package:frostsnap/nostr_chat/contact_book.dart';
 import 'package:frostsnap/nostr_chat/group_info_page.dart';
 import 'package:frostsnap/nostr_chat/member_detail_sheet.dart';
 import 'package:frostsnap/nostr_chat/nostr_profile.dart';
@@ -15,6 +16,7 @@ import 'package:frostsnap/snackbar.dart';
 import 'package:frostsnap/contexts.dart';
 import 'package:frostsnap/src/rust/api/bitcoin.dart';
 import 'package:frostsnap/src/rust/api/nostr.dart';
+import 'package:frostsnap/src/rust/api/nostr/contacts.dart';
 import 'package:frostsnap/src/rust/api/signing.dart'
     show
         RemoteSignSessionId,
@@ -31,6 +33,7 @@ import 'package:frostsnap/global.dart';
 import 'package:frostsnap/theme.dart';
 import 'package:frostsnap/wallet.dart';
 import 'package:frostsnap/wallet_receive.dart';
+import 'package:frostsnap/wallet_contacts.dart';
 import 'package:frostsnap/wallet_tx_details.dart';
 import 'package:dynamic_color/dynamic_color.dart';
 
@@ -337,6 +340,16 @@ class ChatChromeController extends ChangeNotifier {
     _openGroupInfo = handler;
     notifyListeners();
   }
+
+  VoidCallback? _openContacts;
+
+  /// Opens the wallet's shared contacts. Null until the body is ready.
+  VoidCallback? get openContacts => _openContacts;
+
+  void bindOpenContacts(VoidCallback handler) {
+    _openContacts = handler;
+    notifyListeners();
+  }
 }
 
 class _ChatPageBodyState extends State<ChatPageBody> {
@@ -366,6 +379,9 @@ class _ChatPageBodyState extends State<ChatPageBody> {
   final Map<(String, ObservationKind), TimelineTxObservation> _txItemByKey = {};
   NostrClient? _client;
   ChannelHandle? _handle;
+
+  /// The wallet's shared contact book, once the channel has started.
+  ChannelContacts? _contacts;
   ConnectionState _connectionState = const ConnectionState.connecting();
   ReplyTarget? _replyingTo;
   ({AccessStructureRef asRef, String testMessage, List<DeviceId> devices})?
@@ -395,6 +411,7 @@ class _ChatPageBodyState extends State<ChatPageBody> {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         chrome.bindOpenGroupInfo(_openGroupInfo);
+        chrome.bindOpenContacts(_openContacts);
         chrome.updateConnectionState(_connectionState);
       });
     }
@@ -469,6 +486,10 @@ class _ChatPageBodyState extends State<ChatPageBody> {
     // listen-then-start: attaches the broadcast sink before the runner
     // emits Connecting/Connected and replays the cache.
     await _handle!.start();
+    if (!mounted) return;
+    setState(() {
+      _contacts = ChannelContacts(_handle!, widget.accessStructureRef);
+    });
   }
 
   NostrProfile? _getProfile(PublicKey pubkey) {
@@ -1939,10 +1960,29 @@ class _ChatPageBodyState extends State<ChatPageBody> {
     );
   }
 
+  void _openContacts() {
+    final contacts = _contacts;
+    if (contacts == null) {
+      showErrorSnackbar(context, 'Still connecting to the group');
+      return;
+    }
+    final walletCtx = WalletContext.of(context);
+    final page = SpContactsPage(
+      accessStructureRef: widget.accessStructureRef,
+      channel: contacts,
+    );
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => walletCtx != null ? walletCtx.wrap(page) : page,
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _subscription?.cancel();
     _txSubscription?.cancel();
+    _contacts?.dispose();
     _handle?.close();
     _messageController.dispose();
     _scrollController.dispose();
@@ -1956,9 +1996,61 @@ class _ChatPageBodyState extends State<ChatPageBody> {
     return Column(
       children: [
         Expanded(child: _buildTimeline(theme)),
+        _buildContactsBanner(theme),
         _buildSigningBanner(theme),
         _buildMessageInput(),
       ],
+    );
+  }
+
+  /// Contact change sets this member's device can confirm now.
+  Widget _buildContactsBanner(ThemeData theme) {
+    final contacts = _contacts;
+    if (contacts == null) return const SizedBox.shrink();
+    return ValueListenableBuilder(
+      valueListenable: contacts.state,
+      builder: (context, state, _) {
+        final waiting = (state?.ceremonies ?? const <ContactCeremonyView>[])
+            .where(
+              (ceremony) =>
+                  (ceremony.status is CeremonyStatus_WaitingForConfirmations &&
+                      !ceremony.offeredBy.contains(_myPubkey)) ||
+                  ceremony.status is CeremonyStatus_PendingDeviceRestart,
+            )
+            .toList();
+        if (waiting.isEmpty) return const SizedBox.shrink();
+        final first = waiting.first;
+        final who = first.mine
+            ? 'Your contact request'
+            : 'Contact request from ${getDisplayName(_getProfile(first.author), first.author)}';
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(color: theme.colorScheme.primaryContainer),
+          child: Row(
+            children: [
+              const Icon(Icons.contacts, size: 18),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  waiting.length == 1
+                      ? '$who needs your device'
+                      : '${waiting.length} contact requests need your device',
+                ),
+              ),
+              FilledButton(
+                onPressed: () => waiting.length == 1
+                    ? showContactCeremony(context, contacts, first.requestId)
+                    : _openContacts(),
+                style: FilledButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  minimumSize: const Size(0, 36),
+                ),
+                child: const Text('Review'),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 

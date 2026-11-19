@@ -462,6 +462,11 @@ class _RemoteWalletShellState extends State<_RemoteWalletShell> {
                   onPressed: _openTxHistoryTray,
                 ),
                 IconButton(
+                  icon: const Icon(Icons.contacts),
+                  tooltip: 'Contacts',
+                  onPressed: _chrome.openContacts,
+                ),
+                IconButton(
                   icon: const Icon(Icons.group),
                   tooltip: 'Group Info',
                   onPressed: _chrome.openGroupInfo,

@@ -1,13 +1,16 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge.dart';
 import 'package:frostsnap/animated_check.dart';
 import 'package:frostsnap/copy_feedback.dart';
 import 'package:frostsnap/global.dart';
+import 'package:frostsnap/nostr_chat/contact_book.dart';
 import 'package:frostsnap/snackbar.dart';
 import 'package:frostsnap/src/rust/api.dart';
 import 'package:frostsnap/src/rust/api/device_list.dart';
+import 'package:frostsnap/src/rust/api/nostr/contacts.dart';
 import 'package:frostsnap/src/rust/api/signing.dart';
 import 'package:frostsnap/theme.dart';
 import 'package:frostsnap/secure_key_provider.dart';
@@ -138,10 +141,18 @@ class SpContactSuggestions extends StatelessWidget {
 }
 
 /// The wallet's contacts: find, add, check and remove them.
+///
+/// On a wallet coordinated over nostr, [channel] is its shared book: every change goes to the
+/// group as a change set, and the page shows the book's check code and the open requests.
 class SpContactsPage extends StatefulWidget {
   final AccessStructureRef accessStructureRef;
+  final ChannelContacts? channel;
 
-  const SpContactsPage({super.key, required this.accessStructureRef});
+  const SpContactsPage({
+    super.key,
+    required this.accessStructureRef,
+    this.channel,
+  });
 
   @override
   State<SpContactsPage> createState() => _SpContactsPageState();
@@ -167,6 +178,8 @@ class _SpContactsPageState extends State<SpContactsPage> {
   }
 
   Future<void> _open(SpContactEntry contact) async {
+    // A change waits while the shared book syncs.
+    final syncing = widget.channel?.state.value?.book.syncing ?? true;
     await showBottomSheetOrDialog<void>(
       context,
       title: Text(contact.name()),
@@ -183,14 +196,32 @@ class _SpContactsPageState extends State<SpContactsPage> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              TextButton.icon(
-                onPressed: () => _remove(context, contact),
-                style: TextButton.styleFrom(
-                  foregroundColor: Theme.of(context).colorScheme.error,
+              if (widget.channel == null)
+                TextButton.icon(
+                  onPressed: () => _remove(context, contact),
+                  style: TextButton.styleFrom(
+                    foregroundColor: Theme.of(context).colorScheme.error,
+                  ),
+                  label: const Text('Remove from this app'),
+                  icon: const Icon(Icons.delete_outline),
+                )
+              else ...[
+                TextButton.icon(
+                  onPressed: syncing
+                      ? null
+                      : () => _removeFromBook(context, contact),
+                  style: TextButton.styleFrom(
+                    foregroundColor: Theme.of(context).colorScheme.error,
+                  ),
+                  label: const Text('Remove'),
+                  icon: const Icon(Icons.delete_outline),
                 ),
-                label: const Text('Remove from this app'),
-                icon: const Icon(Icons.delete_outline),
-              ),
+                TextButton.icon(
+                  onPressed: syncing ? null : () => _rename(context, contact),
+                  label: const Text('Rename'),
+                  icon: const Icon(Icons.edit_outlined),
+                ),
+              ],
               TextButton.icon(
                 onPressed: () => copyToClipboard(contact.address()),
                 label: const Text('Copy'),
@@ -230,8 +261,89 @@ class _SpContactsPageState extends State<SpContactsPage> {
     if (sheet.mounted) Navigator.pop(sheet);
   }
 
+  /// Asks the group to remove [contact] from the shared book.
+  Future<void> _removeFromBook(
+    BuildContext sheet,
+    SpContactEntry contact,
+  ) async {
+    final name = contact.name();
+    final confirmed = await showDialog<bool>(
+      context: sheet,
+      builder: (context) => AlertDialog(
+        title: Text('Remove $name?'),
+        content: const Text(
+          'This asks the group to remove the contact from every member\'s contacts. '
+          'A threshold of devices confirms it.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Ask to remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !sheet.mounted) return;
+    Navigator.pop(sheet);
+    await widget.channel!.askGroup(context, [
+      ContactChangeView(remove: true, name: name, address: contact.address()),
+    ]);
+  }
+
+  /// Asks the group to rename [contact]: one change set that removes it and adds its address
+  /// under the new name.
+  Future<void> _rename(BuildContext sheet, SpContactEntry contact) async {
+    final oldName = contact.name();
+    final taken = coord
+        .spContacts(keyId: _keyId)
+        .map((contact) => contact.name())
+        .where((name) => name != oldName)
+        .toList();
+    final newName = await showDialog<String>(
+      context: sheet,
+      builder: (context) => _RenameDialog(oldName: oldName, takenNames: taken),
+    );
+    if (newName == null || !sheet.mounted) return;
+    Navigator.pop(sheet);
+    await widget.channel!.askGroup(context, [
+      ContactChangeView(
+        remove: true,
+        name: oldName,
+        address: contact.address(),
+      ),
+      ContactChangeView(
+        remove: false,
+        name: newName,
+        address: contact.address(),
+      ),
+    ]);
+  }
+
+  /// Asks the group to add a contact to the shared book.
+  Future<void> _addToBook() async {
+    final added = await showDialog<ContactChangeView>(
+      context: context,
+      builder: (context) => _AddToBookDialog(
+        takenNames: coord.spContacts(keyId: _keyId).map((c) => c.name()),
+      ),
+    );
+    if (added == null || !mounted) return;
+    await widget.channel!.askGroup(context, [added]);
+  }
+
   @override
   Widget build(BuildContext context) {
+    final channel = widget.channel;
+    if (channel != null) {
+      return ValueListenableBuilder(
+        valueListenable: channel.state,
+        builder: (context, state, _) => _buildBook(channel, state),
+      );
+    }
     final contacts = coord.spContacts(keyId: _keyId);
     return Scaffold(
       appBar: AppBar(title: const Text('Contacts')),
@@ -285,18 +397,274 @@ class _SpContactsPageState extends State<SpContactsPage> {
     }
     return ListView.builder(
       itemCount: matches.length,
-      itemBuilder: (context, index) {
-        final contact = matches[index];
-        return ListTile(
-          leading: const Icon(Icons.person_outline),
-          title: Text(contact.name()),
-          subtitle: Text(
-            _shortAddress(contact.address()),
+      itemBuilder: (context, index) => _contactTile(matches[index]),
+    );
+  }
+
+  Widget _contactTile(SpContactEntry contact) => ListTile(
+    leading: const Icon(Icons.person_outline),
+    title: Text(contact.name()),
+    subtitle: Text(_shortAddress(contact.address()), style: monospaceTextStyle),
+    onTap: () => _open(contact),
+  );
+
+  /// The shared book of a wallet coordinated over nostr.
+  Widget _buildBook(ChannelContacts channel, ContactsState? state) {
+    final theme = Theme.of(context);
+    final book = state?.book;
+    final syncing = book?.syncing ?? true;
+    final contacts = book?.contacts ?? coord.spContacts(keyId: _keyId);
+    final open = (state?.ceremonies ?? const <ContactCeremonyView>[]).where(
+      (ceremony) =>
+          ceremony.status is! CeremonyStatus_Published &&
+          ceremony.status is! CeremonyStatus_Dropped,
+    );
+    final matches = contacts
+        .where(
+          (contact) => contactMatches(
+            _search.text,
+            name: contact.name(),
+            address: contact.address(),
+          ),
+        )
+        .toList();
+    return Scaffold(
+      appBar: AppBar(title: const Text('Contacts')),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: syncing ? null : _addToBook,
+        label: const Text('Add contact'),
+        icon: const Icon(Icons.person_add_alt),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.only(bottom: 96),
+        children: [
+          ListTile(
+            title: const Text('Contacts check code'),
+            subtitle: Text(
+              book?.head.checkCode() ?? '',
+              style: monospaceTextStyle,
+            ),
+            trailing: syncing
+                ? const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SizedBox.square(
+                        dimension: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                      SizedBox(width: 8),
+                      Text('Syncing'),
+                    ],
+                  )
+                : null,
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Text(
+              'Every member of the group shares these contacts. Compare this code with another '
+              'member\'s to check you have the same ones. Changes wait while contacts sync.',
+              style: theme.textTheme.bodySmall,
+            ),
+          ),
+          for (final ceremony in open)
+            Card(
+              margin: const EdgeInsets.all(16),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: ContactCeremonyCard(
+                  contacts: channel,
+                  ceremony: ceremony,
+                ),
+              ),
+            ),
+          for (final dropped
+              in book?.dropped ?? const <List<ContactChangeView>>[])
+            Card(
+              margin: const EdgeInsets.all(16),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text('Dropped changes', style: theme.textTheme.titleSmall),
+                    const Text(
+                      'These changes were confirmed, but another change to the contacts landed '
+                      'first, so they were not applied.',
+                    ),
+                    for (final change in dropped)
+                      ContactChangeTile(change: change),
+                    if (_askedFor(state!, dropped) &&
+                        !channel.askedAgain(dropped))
+                      Align(
+                        alignment: AlignmentDirectional.centerStart,
+                        child: TextButton(
+                          onPressed: syncing
+                              ? null
+                              : () => channel.askGroup(context, dropped),
+                          child: const Text('Ask again'),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: TextField(
+              controller: _search,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                hintText: 'Search name or address',
+                prefixIcon: Icon(Icons.search),
+              ),
+            ),
+          ),
+          if (contacts.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(32),
+              child: Text(
+                'Silent payments go to contacts your devices have confirmed. '
+                'Add one to send a silent payment.',
+                textAlign: TextAlign.center,
+              ),
+            )
+          else if (matches.isEmpty)
+            const Center(child: Text('No matching contacts'))
+          else
+            for (final contact in matches) _contactTile(contact),
+        ],
+      ),
+    );
+  }
+
+  /// Whether this member asked for [changes].
+  bool _askedFor(ContactsState state, List<ContactChangeView> changes) =>
+      state.ceremonies.any(
+        (ceremony) => ceremony.mine && listEquals(ceremony.changes, changes),
+      );
+}
+
+/// Asks for a contact's new name.
+class _RenameDialog extends StatefulWidget {
+  final String oldName;
+  final List<String> takenNames;
+
+  const _RenameDialog({required this.oldName, required this.takenNames});
+
+  @override
+  State<_RenameDialog> createState() => _RenameDialogState();
+}
+
+class _RenameDialogState extends State<_RenameDialog> {
+  late final _name = TextEditingController(text: widget.oldName);
+
+  @override
+  void dispose() {
+    _name.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final name = _name.text.trim();
+    final error = contactNameError(name, widget.takenNames);
+    return AlertDialog(
+      title: Text('Rename ${widget.oldName}'),
+      content: TextField(
+        controller: _name,
+        maxLength: 20,
+        autofocus: true,
+        onChanged: (_) => setState(() {}),
+        decoration: InputDecoration(labelText: 'New name', errorText: error),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        TextButton(
+          onPressed: error != null || name.isEmpty || name == widget.oldName
+              ? null
+              : () => Navigator.pop(context, name),
+          child: const Text('Ask to rename'),
+        ),
+      ],
+    );
+  }
+}
+
+/// Asks for a new contact's name and address.
+class _AddToBookDialog extends StatefulWidget {
+  final Iterable<String> takenNames;
+
+  const _AddToBookDialog({required this.takenNames});
+
+  @override
+  State<_AddToBookDialog> createState() => _AddToBookDialogState();
+}
+
+class _AddToBookDialogState extends State<_AddToBookDialog> {
+  final _name = TextEditingController();
+  final _address = TextEditingController();
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _address.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final name = _name.text.trim();
+    final address = _address.text.trim().toLowerCase();
+    final nameError = contactNameError(name, widget.takenNames);
+    return AlertDialog(
+      title: const Text('Add contact'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: _name,
+            maxLength: 20,
+            autofocus: true,
+            onChanged: (_) => setState(() {}),
+            decoration: InputDecoration(
+              labelText: 'Name',
+              errorText: nameError,
+            ),
+          ),
+          TextField(
+            controller: _address,
+            minLines: 2,
+            maxLines: 5,
+            onChanged: (_) => setState(() {}),
+            decoration: const InputDecoration(
+              labelText: 'Silent payment address',
+            ),
             style: monospaceTextStyle,
           ),
-          onTap: () => _open(contact),
-        );
-      },
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        TextButton(
+          onPressed: nameError != null || name.isEmpty || address.isEmpty
+              ? null
+              : () => Navigator.pop(
+                  context,
+                  ContactChangeView(
+                    remove: false,
+                    name: name,
+                    address: address,
+                  ),
+                ),
+          child: const Text('Ask the group'),
+        ),
+      ],
     );
   }
 }

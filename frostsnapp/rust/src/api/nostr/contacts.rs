@@ -29,6 +29,8 @@ pub struct ContactCeremonyView {
     pub mine: bool,
     pub changes: Vec<ContactChangeView>,
     pub status: CeremonyStatus,
+    /// The members that have confirmed it on a device so far.
+    pub offered_by: Vec<PublicKey>,
     /// Why the last step on this member's device failed, if it did.
     pub error: Option<String>,
 }
@@ -121,6 +123,7 @@ impl ContactsState {
                     status: sync
                         .status(&coordinator, ceremony.request_id)
                         .expect("listed by the driver"),
+                    offered_by: ceremony.offered_by().into_iter().collect(),
                     error: errors.get(&ceremony.request_id).cloned(),
                 })
                 .collect(),
