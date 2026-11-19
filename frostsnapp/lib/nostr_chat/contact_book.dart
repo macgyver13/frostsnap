@@ -349,3 +349,18 @@ class _ContactCeremonyCardState extends State<ContactCeremonyCard> {
     );
   }
 }
+
+/// Why a sign request can't be offered on yet, as far as contacts go, or null if it can.
+String? signGateText(SignGate? gate) => switch (gate) {
+  null => 'Checking contacts...',
+  SignGate_Allowed() => null,
+  SignGate_WaitingForSync() =>
+    'Waiting for contacts to sync. You can offer once your contacts match the requester\'s.',
+  SignGate_RequesterBehind() =>
+    'The requester\'s contacts are out of date. They need to sync and ask again.',
+  SignGate_NotInBook(:final name) =>
+    'This send pays $name, who is not in this wallet\'s contacts, so it can\'t be signed.',
+  SignGate_MissingHead() =>
+    'This send pays a contact but doesn\'t say which contacts it was built from, so it '
+        'can\'t be signed.',
+};

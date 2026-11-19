@@ -1407,6 +1407,7 @@ class _ChatPageBodyState extends State<ChatPageBody> {
                 threshold: threshold,
                 getProfile: _getProfile,
                 deviceForShareIndex: _deviceForShareIndex,
+                contacts: _contacts,
                 scrollController: scrollController,
               ),
             ),
@@ -1420,6 +1421,7 @@ class _ChatPageBodyState extends State<ChatPageBody> {
           threshold: threshold,
           getProfile: _getProfile,
           deviceForShareIndex: _deviceForShareIndex,
+          contacts: _contacts,
           scrollController: scrollController,
         );
       },
@@ -1845,6 +1847,12 @@ class _ChatPageBodyState extends State<ChatPageBody> {
     List<DeviceId> devices,
     WireSignTask signTask,
   ) async {
+    // Checked before reserving nonces, so a refused offer holds no nonce stream.
+    final why = signGateText(await _handle!.signGate(requestId: requestId));
+    if (why != null) {
+      if (mounted) showErrorSnackbar(context, why);
+      return;
+    }
     final reservationId = RemoteSignSessionId(field0: requestId.field0);
     final allBinonces = <ParticipantBinonces>[];
     for (final device in devices) {
@@ -2929,6 +2937,10 @@ class _OfferSignSheet extends StatefulWidget {
   final int threshold;
   final NostrProfile? Function(PublicKey) getProfile;
   final DeviceId? Function(AccessStructureRef, int) deviceForShareIndex;
+
+  /// The wallet's shared contact book, whose head decides whether a send to contacts can be
+  /// offered on.
+  final ChannelContacts? contacts;
   final ScrollController? scrollController;
 
   const _OfferSignSheet({
@@ -2939,6 +2951,7 @@ class _OfferSignSheet extends StatefulWidget {
     required this.threshold,
     required this.getProfile,
     required this.deviceForShareIndex,
+    this.contacts,
     this.scrollController,
   });
 
@@ -2994,14 +3007,47 @@ class _OfferSignSheetState extends State<_OfferSignSheet> {
     return _NoDevicesReason.noneReady;
   }
 
+  /// The contact gate's verdict on this request, checked again whenever the book changes.
+  SignGate? _gate;
+
   @override
   void initState() {
     super.initState();
     _selectedDevices = _deviceItems.map((d) => d.id).toSet();
+    widget.contacts?.state.addListener(_checkGate);
+    _checkGate();
+  }
+
+  @override
+  void dispose() {
+    widget.contacts?.state.removeListener(_checkGate);
+    super.dispose();
+  }
+
+  /// Asks again only while the verdict can still change to allow an offer. A refusal stays, and
+  /// asking again on a stale requester would schedule another republish each time.
+  Future<void> _checkGate() async {
+    final gate = _gate;
+    if (gate != null &&
+        gate is! SignGate_WaitingForSync &&
+        gate is! SignGate_Allowed) {
+      return;
+    }
+    try {
+      final gate = await widget.handle.signGate(
+        requestId: widget.state.request.eventId,
+      );
+      if (mounted) setState(() => _gate = gate);
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
   }
 
   Future<void> _doOffer() async {
     if (_selectedDevices.isEmpty) return;
+    // The book may have moved since the sheet last asked, so ask again before reserving nonces.
+    await _checkGate();
+    if (!mounted || _gate is! SignGate_Allowed) return;
 
     final nsec = await NostrContext.of(context).ensureIdentity(context);
     if (nsec == null || !mounted) return;
@@ -3178,11 +3224,24 @@ class _OfferSignSheetState extends State<_OfferSignSheet> {
                 style: TextStyle(color: theme.colorScheme.error),
               ),
             ),
+          if (signGateText(_gate) case final why?)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Text(
+                why,
+                style: _gate is SignGate_WaitingForSync
+                    ? null
+                    : TextStyle(color: theme.colorScheme.error),
+              ),
+            ),
           if (_deviceItems.isNotEmpty)
             Padding(
               padding: const EdgeInsets.all(16),
               child: FilledButton(
-                onPressed: _selectedDevices.isNotEmpty ? _doOffer : null,
+                onPressed:
+                    _selectedDevices.isNotEmpty && _gate is SignGate_Allowed
+                    ? _doOffer
+                    : null,
                 child: Text(
                   widget.state.offers.length + _selectedDevices.length >=
                           widget.threshold

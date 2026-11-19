@@ -567,10 +567,7 @@ impl ChannelHandle {
         request_id: EventId,
         binonces: Vec<ParticipantBinonces>,
     ) -> Result<EventId> {
-        let gate = self.check_sign_gate(request_id).await?;
-        if gate != contacts::SignGate::Allowed {
-            return Err(anyhow!("can't offer on this request yet: {gate:?}"));
-        }
+        self.require_offer_allowed(request_id).await?;
         let inner = self.require_inner()?;
         let keys = inner.runner_handle.signing_keys().clone();
         inner.send_sign_offer(&keys, request_id, binonces).await

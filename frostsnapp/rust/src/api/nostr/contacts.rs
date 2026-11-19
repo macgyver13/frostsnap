@@ -8,7 +8,10 @@ use crate::contacts_glue::ContactsGlue;
 use crate::frb_generated::StreamSink;
 use anyhow::{anyhow, Result};
 use flutter_rust_bridge::frb;
-use frostsnap_core::silent_payments::{ContactChange, SilentPaymentRecipient, SpContactDetails};
+use frostsnap_core::silent_payments::{
+    ContactBook, ContactChange, SilentPaymentRecipient, SpContactDetails,
+};
+use frostsnap_core::WireSignTask;
 use frostsnap_core::{DeviceId, SymmetricKey};
 pub use frostsnap_nostr::signing::contacts::{CeremonyStatus, SignGate};
 
@@ -225,17 +228,10 @@ impl ChannelHandle {
             .cloned()
             .ok_or_else(|| anyhow!("no such sign request in this channel"))?;
         let Some(glue) = self.contacts.get() else {
-            // Without the book only a send that pays no contact can pass.
-            let Some(network) = self.key_context.purpose.bitcoin_network() else {
-                return Ok(SignGate::Allowed);
-            };
-            let no_book = frostsnap_core::silent_payments::ContactBook::new(network);
-            return Ok(
-                match frostsnap_nostr::signing::contacts::sign_gate(&no_book, &sign_task, None) {
-                    SignGate::Allowed => SignGate::Allowed,
-                    _ => SignGate::MissingHead,
-                },
-            );
+            return Ok(gate_without_book(
+                self.key_context.purpose.bitcoin_network(),
+                &sign_task,
+            ));
         };
         let (gate, actions) = {
             let mut sync = glue.sync.lock().unwrap();
@@ -248,10 +244,152 @@ impl ChannelHandle {
         Ok(gate)
     }
 
+    /// Refuses unless the gate allows an offer on `request_id`.
+    pub(crate) async fn require_offer_allowed(&self, request_id: EventId) -> Result<()> {
+        offer_allowed(&self.check_sign_gate(request_id).await?)
+    }
+
     /// This member's book head, for a sign request that pays a contact.
     pub(crate) fn book_head(&self) -> Result<BookHead> {
         let glue = self.require_contacts()?;
         let coordinator = glue.coord.coordinator.lock().unwrap();
         Ok(coordinator.sp_contact_book_head(glue.key_id))
+    }
+}
+
+/// The gate on a channel with no contact book attached: only a send that pays no contact passes.
+fn gate_without_book(network: Option<bitcoin::Network>, sign_task: &WireSignTask) -> SignGate {
+    let Some(network) = network else {
+        return SignGate::Allowed;
+    };
+    let no_book = ContactBook::new(network);
+    match frostsnap_nostr::signing::contacts::sign_gate(&no_book, sign_task, None) {
+        SignGate::Allowed => SignGate::Allowed,
+        _ => SignGate::MissingHead,
+    }
+}
+
+/// An offer goes out only if the gate allows it; otherwise why not, as the app shows it.
+fn offer_allowed(gate: &SignGate) -> Result<()> {
+    let why = match gate {
+        SignGate::Allowed => return Ok(()),
+        SignGate::MissingHead => {
+            "this request pays a contact but doesn't say which contacts it was built from".into()
+        }
+        SignGate::WaitingForSync => "waiting for contacts to sync".into(),
+        SignGate::RequesterBehind => "the requester's contacts are out of date".into(),
+        SignGate::NotInBook { name } => format!("this request pays {name}, who is not a contact"),
+    };
+    Err(anyhow!("can't offer to sign: {why}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{Amount, Network};
+    use frostsnap_core::bitcoin_transaction::{LocalSpk, TransactionTemplate};
+    use frostsnap_core::schnorr_fun::fun::{g, marker::*, Point, Scalar, G};
+    use frostsnap_core::silent_payments::{
+        ContactChangeSet, SignedSpContact, SignedSpContactChanges, SpContactChanges,
+    };
+    use frostsnap_core::tweak::BitcoinBip32Path;
+    use frostsnap_core::MasterAppkey;
+    use frostsnap_nostr::signing::contacts::sign_gate;
+
+    const NETWORK: Network = Network::Signet;
+
+    fn point(byte: u8) -> Point {
+        let secret = Scalar::<Secret, Zero>::from_bytes_mod_order([byte; 32])
+            .non_zero()
+            .unwrap();
+        g!(secret * G).normalize()
+    }
+
+    /// A set that adds `name` to `book`. The gate never checks signatures, so it has none.
+    fn add(book: &ContactBook, name: &str, byte: u8) -> SignedSpContactChanges {
+        let details = SpContactDetails {
+            name: name.into(),
+            recipient: SilentPaymentRecipient {
+                scan_key: point(byte),
+                spend_key: point(byte + 1),
+            },
+        };
+        SignedSpContactChanges {
+            changes: SpContactChanges {
+                set: ContactChangeSet {
+                    head: book.head(),
+                    changes: vec![ContactChange::Add(details)],
+                },
+                account_ecdh: vec![point(byte + 2)],
+            },
+            signatures: vec![[0; 64]],
+        }
+    }
+
+    fn send_paying(contact: &SignedSpContact) -> WireSignTask {
+        let mut template = TransactionTemplate::new();
+        template.push_imaginary_owned_input(
+            LocalSpk {
+                master_appkey: MasterAppkey::derive_from_rootkey(point(0x77)),
+                bip32_path: BitcoinBip32Path::external(0),
+            },
+            Amount::from_sat(100_000),
+        );
+        let address = contact.contact.details.recipient.address(NETWORK).unwrap();
+        template.push_silent_payment_output(Amount::from_sat(50_000), contact.clone(), address);
+        WireSignTask::BitcoinTransaction(template)
+    }
+
+    /// A reviewer whose book differs from the request's head can't offer: it waits until its
+    /// book reaches that head, and refuses a requester whose book is behind its own. A request
+    /// that pays a contact the book doesn't have, or that names no head, is refused, as is any
+    /// send to a contact on a channel with no book.
+    #[test]
+    fn an_offer_waits_for_the_requesters_book() {
+        let mut requester = ContactBook::new(NETWORK);
+        let add_ann = add(&requester, "Ann", 0x11);
+        requester.insert(add_ann.clone());
+        let ann = requester.by_name("Ann").unwrap().clone();
+        let to_ann = send_paying(&ann);
+        let head = requester.head();
+
+        let mut reviewer = ContactBook::new(NETWORK);
+        let gate = sign_gate(&reviewer, &to_ann, Some(head));
+        assert_eq!(gate, SignGate::WaitingForSync);
+        assert_eq!(
+            offer_allowed(&gate).unwrap_err().to_string(),
+            "can't offer to sign: waiting for contacts to sync"
+        );
+
+        reviewer.insert(add_ann);
+        assert!(offer_allowed(&sign_gate(&reviewer, &to_ann, Some(head))).is_ok());
+
+        reviewer.insert(add(&reviewer, "Bea", 0x21));
+        let gate = sign_gate(&reviewer, &to_ann, Some(head));
+        assert_eq!(gate, SignGate::RequesterBehind);
+        assert_eq!(
+            offer_allowed(&gate).unwrap_err().to_string(),
+            "can't offer to sign: the requester's contacts are out of date"
+        );
+
+        // A contact with the same name and address that isn't the book's own record.
+        let mut forged = ann.clone();
+        forged.signature = [1; 64];
+        let gate = sign_gate(&requester, &send_paying(&forged), Some(head));
+        assert_eq!(
+            offer_allowed(&gate).unwrap_err().to_string(),
+            "can't offer to sign: this request pays Ann, who is not a contact"
+        );
+        assert!(offer_allowed(&sign_gate(&requester, &to_ann, None)).is_err());
+
+        assert_eq!(
+            gate_without_book(Some(NETWORK), &to_ann),
+            SignGate::MissingHead
+        );
+        assert!(offer_allowed(&gate_without_book(Some(NETWORK), &to_ann)).is_err());
+        let test = WireSignTask::Test {
+            message: "no contacts".into(),
+        };
+        assert!(offer_allowed(&gate_without_book(Some(NETWORK), &test)).is_ok());
     }
 }
