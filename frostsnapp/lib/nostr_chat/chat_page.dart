@@ -1057,8 +1057,8 @@ class _ChatPageBodyState extends State<ChatPageBody> {
               key: _timelineKeys.putIfAbsent(tx.txid, () => GlobalKey()),
               tx: tx,
               timestamp: timestamp,
-              onTap: () => _showTxDetails(tx),
-              onBroadcast: signingState != null
+              onTap: () => _showTxDetails(tx, signingState: signingState),
+              onBroadcast: signingState != null && !signingState.cancelled
                   ? () => _broadcastTransaction(signingState)
                   : null,
             ),
@@ -1451,7 +1451,7 @@ class _ChatPageBodyState extends State<ChatPageBody> {
     }
   }
 
-  void _showTxDetails(Transaction tx) {
+  void _showTxDetails(Transaction tx, {SigningRequestState? signingState}) {
     final walletCtx = WalletContext.of(context);
     if (walletCtx == null) return;
     final fsCtx = FrostsnapContext.of(context);
@@ -1471,12 +1471,30 @@ class _ChatPageBodyState extends State<ChatPageBody> {
           txStates: walletCtx.txStream,
           txDetails: txDetails,
           psbtMan: fsCtx.psbtManager,
+          onCancelRemote: signingState == null
+              ? null
+              : () => _cancelSignedRequest(signingState),
         ),
       ),
     );
   }
 
+  /// Cancels a signed request that was never broadcast. Only its requester can, and the cancel
+  /// reaches every member, whose chat then stops offering to broadcast it.
+  Future<bool> _cancelSignedRequest(SigningRequestState state) async {
+    if (state.request.author != _myPubkey) {
+      showErrorSnackbar(
+        context,
+        'Only the member who asked for this transaction can cancel it.',
+      );
+      return false;
+    }
+    if (!state.cancelled) await _onCancelRequest(state);
+    return state.cancelled;
+  }
+
   Future<void> _broadcastTransaction(SigningRequestState state) async {
+    if (state.cancelled) return;
     final sealed = state.sealedData;
     if (sealed == null) return;
     final walletCtx = WalletContext.of(context);

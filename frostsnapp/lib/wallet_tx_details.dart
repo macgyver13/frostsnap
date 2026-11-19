@@ -303,6 +303,10 @@ class TxDetailsPage extends StatefulWidget {
   /// and the page builds it from `unsignedTx.complete(sigs)`.
   final SignedTx? signedTx;
 
+  /// Cancels a transaction signed over a nostr channel, which has no signing session in this app.
+  /// Returns whether it was cancelled.
+  final Future<bool> Function()? onCancelRemote;
+
   const TxDetailsPage({
     super.key,
     this.scrollController,
@@ -312,6 +316,7 @@ class TxDetailsPage extends StatefulWidget {
     this.signingParams,
     this.finishedSigningSessionId,
     this.psbt,
+    this.onCancelRemote,
   }) : signedTx = null;
 
   const TxDetailsPage.needsBroadcast({
@@ -323,7 +328,8 @@ class TxDetailsPage extends StatefulWidget {
     required SignSessionId this.finishedSigningSessionId,
     required SignedTx this.signedTx,
   }) : signingParams = null,
-       psbt = null;
+       psbt = null,
+       onCancelRemote = null;
 
   bool get isSigning => signingParams != null;
 
@@ -791,12 +797,22 @@ class _TxDetailsPageState extends State<TxDetailsPage> {
   }
 
   showCancelBroadcastDialog(BuildContext context) async {
+    final cancelRemote = widget.onCancelRemote;
+    if (ssid == null && cancelRemote == null) {
+      showErrorSnackbar(
+        context,
+        'This transaction has no signing session in this app to cancel.',
+      );
+      return;
+    }
     final result = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: Text('Cancel Transaction'),
         content: Text(
-          psbt != null
+          ssid == null
+              ? 'The signing request is cancelled for the whole group. It is already fully signed, so a member who saved the transaction could still broadcast it.'
+              : psbt != null
               ? 'Transaction canceled. No Bitcoin will be sent unless you have already exported the PSBT.'
               : 'No Bitcoin will be sent.',
         ),
@@ -814,8 +830,11 @@ class _TxDetailsPageState extends State<TxDetailsPage> {
       ),
     );
     if (result ?? false) {
-      if (ssid == null) return;
-      await coord.forgetFinishedSignSession(ssid: ssid!);
+      if (ssid == null) {
+        if (!await cancelRemote!()) return;
+      } else {
+        await coord.forgetFinishedSignSession(ssid: ssid!);
+      }
       if (context.mounted) Navigator.pop(context);
     }
   }
