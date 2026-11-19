@@ -145,7 +145,8 @@ pub struct RecipientLine {
     pub address: String,
     pub amount_sat: u64,
     pub is_silent_payment: bool,
-    /// The contact a silent payment line pays.
+    /// The contact a silent payment line pays. `None` on a silent payment line is a new contact,
+    /// named by the label.
     pub contact: Option<SpContactEntry>,
 }
 
@@ -698,12 +699,15 @@ pub enum TryFinishTxError {
 }
 
 /// Parses and checks a recipients file of `address,amount_sat[,label]` lines, matching its silent
-/// payment lines to `contacts`.
+/// payment lines to `contacts`. With `allow_new_contacts`, a silent payment line that is not a
+/// contact comes back with no contact, to be added under its label before the send; without it
+/// such a line is refused.
 #[frb(sync)]
 pub fn parse_recipients_file(
     contents: String,
     network: BitcoinNetwork,
     contacts: Vec<SpContactEntry>,
+    allow_new_contacts: bool,
 ) -> Result<Vec<RecipientLine>, String> {
     let entries = recipients_file::parse_csv(&contents)?;
     recipients_file::validate(&entries, network)?;
@@ -711,7 +715,7 @@ pub fn parse_recipients_file(
         .iter()
         .map(|entry| entry.contact.clone())
         .collect::<Vec<_>>();
-    let matched = recipients_file::match_contacts(&entries, network, &signed)?;
+    let matched = recipients_file::match_contacts(&entries, network, &signed, allow_new_contacts)?;
     Ok(entries
         .into_iter()
         .zip(matched)

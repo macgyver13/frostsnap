@@ -4,7 +4,9 @@
 use bdk_chain::bitcoin::{self, Network};
 use frostsnap_core::{
     bitcoin_transaction::SilentPaymentOutput,
-    silent_payments::{SignedSpContact, SilentPaymentRecipient},
+    silent_payments::{
+        SignedSpContact, SilentPaymentRecipient, SpContactDetails, MAX_CONTACT_NAME_LEN,
+    },
 };
 use std::str::FromStr;
 
@@ -122,20 +124,33 @@ pub fn silent_payment_min_non_dust() -> u64 {
         .to_sat()
 }
 
-/// The contact each line pays, by its index in `contacts`, or `None` for an ordinary address.
+/// The contact each line pays, by its index in `contacts`, or `None` for an ordinary address or,
+/// with `allow_new`, a new contact.
 ///
-/// A silent payment line must pay one of `contacts`, found by its address. A label must agree
-/// with the contacts: on a contact's line it must be that contact's name, and a label that names
-/// a contact must be on that contact's line, since that is how an address substitution would
-/// look. Names compare ignoring case, as contact names do. Every line that disagrees is reported,
-/// and the file has to be fixed.
+/// A silent payment line pays one of `contacts`, found by its address. A label must agree with
+/// the contacts: on a contact's line it must be that contact's name, and a label that names a
+/// contact must be on that contact's line, since that is how an address substitution would look.
+/// Names compare ignoring case, as contact names do.
+///
+/// With `allow_new`, a silent payment address that is not a contact is a new contact named by its
+/// label, which must be a valid contact name. The caller adds the new contacts before the send.
+/// A new name on any other address, or one new address under two names, is refused, since the
+/// name will be a contact's by the time the send is built. Without `allow_new`, such a line is
+/// refused.
+///
+/// Every line that disagrees is reported, and the file has to be fixed.
 pub fn match_contacts(
     entries: &[RecipientEntry],
     network: Network,
     contacts: &[SignedSpContact],
+    allow_new: bool,
 ) -> Result<Vec<Option<usize>>, String> {
     let mut errors = Vec::new();
     let mut matched = Vec::with_capacity(entries.len());
+    // The new contacts so far: the line that named each, its address and name.
+    let mut new: Vec<(usize, SilentPaymentRecipient, &str)> = Vec::new();
+    // The labels of ordinary address lines so far, with their lines.
+    let mut ordinary: Vec<(usize, &str)> = Vec::new();
 
     for entry in entries {
         let line = entry.line;
@@ -145,12 +160,28 @@ pub fn match_contacts(
                 .iter()
                 .position(|contact| contact.contact.details.recipient == recipient)
         });
-        if recipient.is_some() && paid.is_none() {
-            // TODO: add unknown silent payment addresses as contacts in one batch ceremony,
-            // named by their labels, instead of refusing the file.
-            errors.push(format!(
-                "Line {line}: this silent payment address is not a contact. Add it as a contact first."
-            ));
+        if let (Some(recipient), None) = (recipient, paid) {
+            if !allow_new {
+                errors.push(format!(
+                    "Line {line}: this silent payment address is not a contact. Add it as a contact first."
+                ));
+            } else if let Some(error) = new_contact_error(entry, recipient, &new, &ordinary) {
+                errors.push(error);
+            } else if let Some(label) = &entry.label {
+                new.push((line, recipient, label));
+            }
+        }
+
+        if let (None, Some(label)) = (recipient, &entry.label) {
+            if let Some((other_line, _, _)) = new
+                .iter()
+                .find(|(_, _, name)| name.eq_ignore_ascii_case(label))
+            {
+                errors.push(format!(
+                    "Line {line}: \"{label}\" is a new contact with a different address on line {other_line}"
+                ));
+            }
+            ordinary.push((line, label));
         }
 
         if let Some(label) = &entry.label {
@@ -179,15 +210,75 @@ pub fn match_contacts(
     }
 }
 
+/// Why `entry`, at `recipient`, which is not a contact, cannot be the new contact its label names,
+/// given the new contacts and the labels of ordinary addresses on earlier lines.
+fn new_contact_error(
+    entry: &RecipientEntry,
+    recipient: SilentPaymentRecipient,
+    new: &[(usize, SilentPaymentRecipient, &str)],
+    ordinary: &[(usize, &str)],
+) -> Option<String> {
+    let line = entry.line;
+    let Some(label) = &entry.label else {
+        return Some(format!(
+            "Line {line}: this silent payment address is not a contact. Give it a label to add it as one."
+        ));
+    };
+    let details = SpContactDetails {
+        name: label.clone(),
+        recipient,
+    };
+    if !details.has_valid_name() {
+        return Some(format!(
+            "Line {line}: label \"{label}\" can't be a contact name. Use 1 to {MAX_CONTACT_NAME_LEN} plain letters, numbers and symbols."
+        ));
+    }
+    if let Some((other_line, _)) = ordinary
+        .iter()
+        .find(|(_, other)| other.eq_ignore_ascii_case(label))
+    {
+        return Some(format!(
+            "Line {line}: \"{label}\" is the label of line {other_line}, which has a different address"
+        ));
+    }
+    new.iter().find_map(|(other_line, other, name)| {
+        let same_name = name.eq_ignore_ascii_case(label);
+        if *other == recipient && !same_name {
+            Some(format!(
+                "Line {line}: this address is \"{name}\" on line {other_line}"
+            ))
+        } else if *other != recipient && same_name {
+            Some(format!(
+                "Line {line}: \"{label}\" is a new contact with a different address on line {other_line}"
+            ))
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use frostsnap_core::{
-        schnorr_fun::fun::Point,
-        silent_payments::{SpContact, SpContactDetails},
+        schnorr_fun::fun::{g, marker::*, Point, Scalar, G},
+        silent_payments::SpContact,
     };
 
     const TB1_ADDR: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+
+    /// A silent payment address whose keys are `byte` times the generator.
+    fn other_sp_address(byte: u8) -> String {
+        let secret = Scalar::<Secret, Zero>::from_bytes_mod_order([byte; 32])
+            .non_zero()
+            .unwrap();
+        let point = g!(secret * G).normalize();
+        let recipient = SilentPaymentRecipient {
+            scan_key: point,
+            spend_key: point,
+        };
+        recipient.address(Network::Testnet).unwrap()
+    }
 
     fn sp_address() -> String {
         let scan = [
@@ -337,15 +428,20 @@ mod tests {
             labelled(3, &sp_address(), "alice"),
         ];
         assert_eq!(
-            match_contacts(&entries, Network::Testnet, &contacts).unwrap(),
+            match_contacts(&entries, Network::Testnet, &contacts, false).unwrap(),
             vec![None, Some(0), Some(0)]
         );
     }
 
     #[test]
     fn an_unknown_silent_payment_address_is_refused() {
-        let err =
-            match_contacts(&[entry(2, &sp_address(), 50_000)], Network::Testnet, &[]).unwrap_err();
+        let err = match_contacts(
+            &[entry(2, &sp_address(), 50_000)],
+            Network::Testnet,
+            &[],
+            false,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             "Line 2: this silent payment address is not a contact. Add it as a contact first."
@@ -360,11 +456,74 @@ mod tests {
             labelled(2, TB1_ADDR, "Alice"),
             labelled(3, TB1_ADDR, "Carol"),
         ];
-        let err = match_contacts(&entries, Network::Testnet, &contacts).unwrap_err();
+        let err = match_contacts(&entries, Network::Testnet, &contacts, false).unwrap_err();
         assert_eq!(
             err,
             "Line 1: label \"Bob\" is not \"Alice\", the contact at this address\n\
              Line 2: \"Alice\" is a contact with a different address"
         );
+    }
+
+    #[test]
+    fn a_new_address_is_a_new_contact_named_by_its_label() {
+        let contacts = [contact("Alice", &sp_address())];
+        let bob = other_sp_address(0x11);
+        let entries = [
+            entry(1, &sp_address(), 50_000),
+            labelled(2, &bob, "Bob"),
+            // The same new address again, under its name in another case.
+            labelled(3, &bob, "BOB"),
+            entry(4, TB1_ADDR, 50_000),
+        ];
+        assert_eq!(
+            match_contacts(&entries, Network::Testnet, &contacts, true).unwrap(),
+            vec![Some(0), None, None, None]
+        );
+    }
+
+    #[test]
+    fn a_new_address_needs_a_label_that_can_be_a_new_name() {
+        let contacts = [contact("Alice", &sp_address())];
+        let entries = [
+            entry(1, &other_sp_address(0x11), 50_000),
+            labelled(2, &other_sp_address(0x12), "a name longer than twenty"),
+            labelled(3, &other_sp_address(0x13), "caf\u{e9}"),
+            labelled(4, &other_sp_address(0x14), "alice"),
+            labelled(5, &other_sp_address(0x15), "Dan"),
+            labelled(6, &other_sp_address(0x16), "dan"),
+            labelled(7, &other_sp_address(0x15), "Eve"),
+        ];
+        let err = match_contacts(&entries, Network::Testnet, &contacts, true).unwrap_err();
+        assert_eq!(
+            err,
+            "Line 1: this silent payment address is not a contact. Give it a label to add it as one.\n\
+             Line 2: label \"a name longer than twenty\" can't be a contact name. Use 1 to 20 plain letters, numbers and symbols.\n\
+             Line 3: label \"caf\u{e9}\" can't be a contact name. Use 1 to 20 plain letters, numbers and symbols.\n\
+             Line 4: \"alice\" is a contact with a different address\n\
+             Line 6: \"dan\" is a new contact with a different address on line 5\n\
+             Line 7: this address is \"Dan\" on line 5"
+        );
+    }
+
+    /// A new name is a contact by the time the send is built, so a line paying another address
+    /// under it is refused now, whichever comes first.
+    #[test]
+    fn a_new_name_on_an_ordinary_address_is_refused() {
+        let dan = other_sp_address(0x15);
+        for (first, second) in [(1, 2), (2, 1)] {
+            let entries = [
+                labelled(first, &dan, "Dan"),
+                labelled(second, TB1_ADDR, "dan"),
+            ];
+            let mut entries = entries.to_vec();
+            entries.sort_by_key(|entry| entry.line);
+            let err = match_contacts(&entries, Network::Testnet, &[], true).unwrap_err();
+            let expected = if first == 1 {
+                "Line 2: \"dan\" is a new contact with a different address on line 1"
+            } else {
+                "Line 2: \"Dan\" is the label of line 1, which has a different address"
+            };
+            assert_eq!(err, expected);
+        }
     }
 }

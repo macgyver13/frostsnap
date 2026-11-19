@@ -1066,6 +1066,7 @@ class _WalletSendPageState extends State<WalletSendPage> {
         contents: contents,
         network: widget.superWallet.network,
         contacts: coord.spContacts(keyId: _contactsRef.keyId),
+        allowNewContacts: false,
       );
     } catch (e) {
       if (context.mounted) {
