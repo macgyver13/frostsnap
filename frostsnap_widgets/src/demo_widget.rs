@@ -572,6 +572,36 @@ macro_rules! demo_widget {
                 let widget = SignTxPrompt::new(prompt);
                 $run_macro!(widget);
             }
+            "sp_contact_prompt" | "sp_contact_changes" => {
+                use $crate::sign_prompt::{ContactChangeItem, SpContactPrompt};
+
+                // BIP352's example address, for every change.
+                let address = "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv";
+                let change = |remove: bool, name: &str| ContactChangeItem {
+                    remove,
+                    name: name.into(),
+                    address: address.into(),
+                };
+                // A single add, or a rename and four adds, which is over the list threshold.
+                let demo: &str = $demo.as_ref();
+                let changes = if demo == "sp_contact_prompt" {
+                    $crate::alloc::vec![change(false, "Alice")]
+                } else {
+                    $crate::alloc::vec![
+                        change(true, "Bob"),
+                        change(false, "Robert"),
+                        change(false, "Carol"),
+                        change(false, "WWWWWWWWWWWWWWWWWWWW"),
+                        change(false, "Dave"),
+                    ]
+                };
+                let widget = SpContactPrompt::new(
+                    changes,
+                    0,
+                    $crate::DEFAULT_LIST_REVIEW_THRESHOLD,
+                );
+                $run_macro!(widget);
+            }
             "bitcoin_amount" => {
                 use $crate::{bitcoin_amount_display::BitcoinAmountDisplay, Column, MainAxisAlignment};
 

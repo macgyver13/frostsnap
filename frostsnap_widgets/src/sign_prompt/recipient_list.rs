@@ -1,4 +1,4 @@
-use super::{AddressPage, SilentPaymentAddressPage};
+use super::{AddressPage, ContactChangeItem, SilentPaymentAddressPage};
 use crate::{
     any_of::AnyOf,
     gray4_style::Gray4TextStyle,
@@ -34,6 +34,12 @@ pub enum RecipientItem {
         address: String,
         amount: bitcoin::Amount,
     },
+    /// A change in a contact change set. Its row shows the kind of change and the name instead of
+    /// an amount.
+    ContactChange {
+        index: usize,
+        change: ContactChangeItem,
+    },
 }
 
 impl RecipientItem {
@@ -41,13 +47,7 @@ impl RecipientItem {
         match self {
             RecipientItem::Foreign { index, .. } => *index,
             RecipientItem::SilentPayment { index, .. } => *index,
-        }
-    }
-
-    pub fn amount(&self) -> bitcoin::Amount {
-        match self {
-            RecipientItem::Foreign { amount, .. } => *amount,
-            RecipientItem::SilentPayment { amount, .. } => *amount,
+            RecipientItem::ContactChange { index, .. } => *index,
         }
     }
 }
@@ -134,6 +134,14 @@ impl RecipientListPage {
                     address,
                     self.rand_seed,
                 )),
+                RecipientItem::ContactChange { index, change } => {
+                    AnyOf::new(SilentPaymentAddressPage::new_with_seed(
+                        *index,
+                        change.title(),
+                        &change.address,
+                        self.rand_seed,
+                    ))
+                }
             };
             page.set_constraints(self.size);
             page.force_full_redraw();
@@ -314,17 +322,45 @@ impl Widget for RecipientListPage {
                     current_time,
                 )?;
 
-                // Amount
-                let mut amount_text = Text::new(
-                    format!("{}", item.amount()),
-                    Gray4TextStyle::new(&NOTO_SANS_17_REGULAR, PALETTE.on_background),
-                );
-                let amount_width = amount_text.sizing().width as i32;
-                let amount_x = screen_width - 28 - amount_width;
-                amount_text.draw(
-                    &mut target.clone().translate(Point::new(amount_x, text_y)),
-                    current_time,
-                )?;
+                match item {
+                    RecipientItem::Foreign { amount, .. }
+                    | RecipientItem::SilentPayment { amount, .. } => {
+                        let mut amount_text = Text::new(
+                            format!("{amount}"),
+                            Gray4TextStyle::new(&NOTO_SANS_17_REGULAR, PALETTE.on_background),
+                        );
+                        let amount_width = amount_text.sizing().width as i32;
+                        let amount_x = screen_width - 28 - amount_width;
+                        amount_text.draw(
+                            &mut target.clone().translate(Point::new(amount_x, text_y)),
+                            current_time,
+                        )?;
+                    }
+                    RecipientItem::ContactChange { change, .. } => {
+                        // A long name is cut short before the chevron. Its row opens the whole
+                        // name.
+                        let kind = if change.remove { "-" } else { "+" };
+                        let mut change_text = Text::new(
+                            format!("{kind} {}", change.name),
+                            Gray4TextStyle::new(&NOTO_SANS_17_REGULAR, PALETTE.on_background),
+                        );
+                        let left = 52;
+                        let clip = Rectangle::new(
+                            Point::new(left, row_y),
+                            Size::new(
+                                (screen_width - 28 - left).max(0) as u32,
+                                RECIPIENT_ROW_HEIGHT as u32,
+                            ),
+                        );
+                        change_text.draw(
+                            &mut target
+                                .clone()
+                                .crop(clip)
+                                .translate(Point::new(0, text_y - row_y)),
+                            current_time,
+                        )?;
+                    }
+                }
 
                 // Right chevron ">"
                 let mut chevron_text = Text::new(

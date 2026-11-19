@@ -8,9 +8,9 @@ use frostsnap_widgets::{
     backup::{BackupDisplay, CheckBackupScreen, EnterShareScreen},
     keygen_check::KeygenCheck,
     layout::*,
-    sign_prompt::{SignTxPrompt, SpContactPrompt},
+    sign_prompt::{ContactChangeItem, SignTxPrompt, SpContactPrompt},
     DeviceNameScreen, EraseDevice, EraseProgress, FirmwareUpgradeConfirm, FirmwareUpgradeProgress,
-    HoldToConfirm, SignMessageConfirm, Standby, Text,
+    HoldToConfirm, SignMessageConfirm, Standby, Text, DEFAULT_LIST_REVIEW_THRESHOLD,
 };
 
 use crate::ui::FirmwareUpgradeStatus;
@@ -108,9 +108,13 @@ impl WidgetTree {
     #[inline(never)]
     pub(crate) fn build_sp_contact_prompt(phase: Box<SpContactEcdhPhase>, rand_seed: u32) -> Self {
         let widget = Box::new(SpContactPrompt::new(
-            phase.name().into(),
-            phase.address().into(),
+            alloc::vec![ContactChangeItem {
+                remove: false,
+                name: phase.name().into(),
+                address: phase.address().into(),
+            }],
             rand_seed,
+            DEFAULT_LIST_REVIEW_THRESHOLD,
         ));
         Self::SpContactPrompt {
             widget,

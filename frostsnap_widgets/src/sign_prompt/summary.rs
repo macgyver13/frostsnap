@@ -1,4 +1,4 @@
-use super::{FONT_CONFIRM_TEXT, FONT_PAGE_HEADER};
+use super::{FONT_CONFIRM_TEXT, FONT_CONFIRM_TITLE, FONT_PAGE_HEADER};
 use crate::{
     bitcoin_amount_display::BitcoinAmountDisplay, gray4_style::Gray4TextStyle, palette::PALETTE,
     prelude::*,
@@ -59,6 +59,50 @@ impl SummaryPage {
         column.set_gap(0, 4);
         column.set_gap(1, 2);
         column.set_gap(2, 8);
+
+        Self {
+            center: Center::new(column),
+        }
+    }
+}
+
+/// Summary page for a contact change set too long to show one change at a time.
+#[derive(frostsnap_macros::Widget)]
+pub struct ContactChangesSummaryPage {
+    #[widget_delegate]
+    center: Center<
+        Column<(
+            Text<Gray4TextStyle>,
+            Text<Gray4TextStyle>,
+            Text<Gray4TextStyle>,
+        )>,
+    >,
+}
+
+impl ContactChangesSummaryPage {
+    #[inline(never)]
+    pub fn new(changes: &[super::ContactChangeItem]) -> Self {
+        let removes = changes.iter().filter(|change| change.remove).count();
+        let adds = changes.len() - removes;
+        let title = Text::new(
+            format!("{} contact changes", changes.len()),
+            Gray4TextStyle::new(FONT_PAGE_HEADER, PALETTE.text_secondary),
+        );
+        let counts = Text::new(
+            format!("{adds} to add\n{removes} to remove"),
+            Gray4TextStyle::new(FONT_CONFIRM_TITLE, PALETTE.on_background),
+        )
+        .with_alignment(embedded_graphics::text::Alignment::Center);
+        let note = Text::new(
+            "Check each one against\nyour own records".to_string(),
+            Gray4TextStyle::new(FONT_CONFIRM_TEXT, PALETTE.text_secondary),
+        )
+        .with_alignment(embedded_graphics::text::Alignment::Center);
+
+        let mut column = Column::new((title, counts, note))
+            .with_main_axis_alignment(MainAxisAlignment::Center)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center);
+        column.set_uniform_gap(14);
 
         Self {
             center: Center::new(column),

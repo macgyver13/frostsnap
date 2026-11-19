@@ -30,7 +30,7 @@ mod recipient_list;
 mod summary;
 
 use recipient_list::{RecipientItem, RecipientListPage};
-use summary::SummaryPage;
+use summary::{ContactChangesSummaryPage, SummaryPage};
 
 const FONT_PAGE_HEADER: &Gray4Font = &NOTO_SANS_18_LIGHT;
 const FONT_CONFIRM_TITLE: &Gray4Font = &NOTO_SANS_18_MEDIUM;
@@ -384,6 +384,7 @@ type SignPromptPage = AnyOf<(
     ConfirmationPage,
     SummaryPage,
     RecipientListPage,
+    ContactChangesSummaryPage,
 )>;
 
 impl SignPromptPageList {
@@ -631,54 +632,116 @@ impl SignTxPrompt {
     }
 }
 
-/// The pages of adding a contact: its name and address, then the hold.
+/// One change to the contact book that the user confirms: a contact added or removed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContactChangeItem {
+    pub remove: bool,
+    pub name: String,
+    pub address: String,
+}
+
+impl ContactChangeItem {
+    /// The kind of change on one line and the name on the next, so the longest name fits.
+    fn title(&self) -> String {
+        let kind = if self.remove { "Remove" } else { "Add" };
+        format!("{kind} contact\n{}", self.name)
+    }
+}
+
+/// The pages of a contact change set. Up to `list_threshold` changes, each change's name and
+/// address in turn. Above it, a summary and a list where each row opens its change. Then one hold
+/// for the whole set.
 pub struct SpContactPageList {
-    name: String,
-    address: String,
+    changes: Vec<ContactChangeItem>,
+    list_threshold: usize,
     rand_seed: u32,
+}
+
+impl SpContactPageList {
+    fn uses_list(&self) -> bool {
+        self.changes.len() > self.list_threshold
+    }
 }
 
 impl WidgetList for SpContactPageList {
     type Widget = SignPromptPage;
 
     fn len(&self) -> usize {
-        2
-    }
-
-    fn get(&self, index: usize) -> Option<WidgetListItem<SignPromptPage>> {
-        match index {
-            0 => Some(
-                WidgetListItem::new(SignPromptPage::new(
-                    SilentPaymentAddressPage::new_with_seed(
-                        0,
-                        format!("Add {}", self.name),
-                        &self.address,
-                        self.rand_seed,
-                    ),
-                ))
-                .with_framebuffer_transitions(true),
-            ),
-            1 => Some(WidgetListItem::new(SignPromptPage::new(
-                ConfirmationPage::with_text(
-                    "Hold to Trust",
-                    "Is the address right?",
-                    "Press and hold",
-                ),
-            ))),
-            _ => None,
+        if self.uses_list() {
+            3
+        } else {
+            self.changes.len() + 1
         }
     }
 
+    fn get(&self, index: usize) -> Option<WidgetListItem<SignPromptPage>> {
+        if index + 1 == self.len() {
+            return Some(WidgetListItem::new(SignPromptPage::new(
+                ConfirmationPage::with_text(
+                    "Hold to Confirm",
+                    "Are the contacts right?",
+                    "Press and hold",
+                ),
+            )));
+        }
+        if self.uses_list() {
+            let page = match index {
+                0 => SignPromptPage::new(ContactChangesSummaryPage::new(&self.changes)),
+                1 => SignPromptPage::new(RecipientListPage::new(
+                    self.changes
+                        .iter()
+                        .enumerate()
+                        .map(|(index, change)| RecipientItem::ContactChange {
+                            index,
+                            change: change.clone(),
+                        })
+                        .collect(),
+                    self.rand_seed,
+                )),
+                _ => return None,
+            };
+            return Some(WidgetListItem::new(page));
+        }
+        let change = self.changes.as_slice().get(index)?;
+        Some(
+            WidgetListItem::new(SignPromptPage::new(
+                SilentPaymentAddressPage::new_with_seed(
+                    index,
+                    change.title(),
+                    &change.address,
+                    self.rand_seed,
+                ),
+            ))
+            .with_framebuffer_transitions(true),
+        )
+    }
+
     fn can_go_prev(&self, from_index: usize, current_widget: &SignPromptPage) -> bool {
-        from_index == 1
-            && !current_widget
-                .downcast_ref::<ConfirmationPage>()
-                .is_some_and(ConfirmationPage::is_confirmed)
+        if from_index == 0 {
+            return false;
+        }
+        if let Some(confirmation_page) = current_widget.downcast_ref::<ConfirmationPage>() {
+            return !confirmation_page.is_confirmed();
+        }
+        if let Some(list_page) = current_widget.downcast_ref::<RecipientListPage>() {
+            return list_page.can_go_prev();
+        }
+        true
+    }
+
+    fn can_go_next(&self, from_index: usize, current_widget: &SignPromptPage) -> bool {
+        if from_index + 1 >= self.len() {
+            return false;
+        }
+        if let Some(list_page) = current_widget.downcast_ref::<RecipientListPage>() {
+            return list_page.can_go_next();
+        }
+        true
     }
 }
 
-/// The prompt to add a trusted contact. This is where the user checks the address: a send to the
-/// contact relies on this check.
+/// The prompt to change the contact book. This is where the user checks each name and address: a
+/// send to a contact relies on this check.
 #[derive(frostsnap_macros::Widget)]
 pub struct SpContactPrompt {
     #[widget_delegate]
@@ -686,10 +749,12 @@ pub struct SpContactPrompt {
 }
 
 impl SpContactPrompt {
-    pub fn new(name: String, address: String, rand_seed: u32) -> Self {
+    /// `list_threshold` is the number of changes above which the review is a summary and a list,
+    /// see [`SignTxPrompt::new_with_seed_and_threshold`].
+    pub fn new(changes: Vec<ContactChangeItem>, rand_seed: u32, list_threshold: usize) -> Self {
         let mut page_slider = Box::new(PageSlider::new(SpContactPageList {
-            name,
-            address,
+            changes,
+            list_threshold,
             rand_seed,
         }));
         page_slider.set_on_page_ready(|page| {
@@ -727,10 +792,15 @@ mod test {
     #[test]
     fn the_longest_contact_name_fits_on_the_address_page() {
         use frostsnap_core::silent_payments::MAX_CONTACT_NAME_LEN;
-        for prefix in ["To", "Add"] {
-            let name = "W".repeat(MAX_CONTACT_NAME_LEN);
-            let title = contact_title(format!("{prefix} {name}"));
-            assert!(title.sizing().width <= 240);
+        let name = "W".repeat(MAX_CONTACT_NAME_LEN);
+        assert!(contact_title(format!("To {name}")).sizing().width <= 240);
+        for remove in [false, true] {
+            let change = ContactChangeItem {
+                remove,
+                name: name.clone(),
+                address: String::new(),
+            };
+            assert!(contact_title(change.title()).sizing().width <= 240);
         }
     }
 }
@@ -775,5 +845,32 @@ mod tests {
         // The default keeps one page per recipient up to three.
         assert_eq!(pages(3, DEFAULT_LIST_REVIEW_THRESHOLD), per_recipient(3));
         assert_eq!(pages(4, DEFAULT_LIST_REVIEW_THRESHOLD), LIST);
+    }
+
+    #[test]
+    fn contact_change_list_starts_above_the_threshold() {
+        let changes = |n: usize| {
+            (0..n)
+                .map(|i| ContactChangeItem {
+                    remove: i % 2 == 1,
+                    name: format!("Contact {i}"),
+                    address: format!("tsp1recipient{i}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let pages = |n: usize| {
+            SpContactPageList {
+                changes: changes(n),
+                list_threshold: DEFAULT_LIST_REVIEW_THRESHOLD,
+                rand_seed: 0,
+            }
+            .len()
+        };
+        // One page per change, then the hold.
+        assert_eq!(pages(1), 2);
+        assert_eq!(pages(3), 4);
+        // Summary, list, hold.
+        assert_eq!(pages(4), 3);
+        assert_eq!(pages(40), 3);
     }
 }
