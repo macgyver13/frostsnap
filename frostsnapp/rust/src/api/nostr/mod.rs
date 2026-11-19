@@ -1446,8 +1446,12 @@ pub struct _NostrProfile {
 }
 
 /// Get default relay URLs (public relays for profile/event discovery).
+/// `FROSTSNAP_NOSTR_RELAYS` (comma separated) replaces them, for demos on a local relay.
 #[frb(sync)]
 pub fn default_relay_urls() -> Vec<String> {
+    if let Ok(urls) = std::env::var("FROSTSNAP_NOSTR_RELAYS") {
+        return urls.split(',').map(|url| url.trim().to_string()).collect();
+    }
     vec![
         "wss://relay.damus.io".to_string(),
         "wss://nos.lol".to_string(),

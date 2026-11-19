@@ -1,0 +1,6 @@
+# Second batch for the SP contacts demo: pays the two contacts the first batch added, so no
+# contact ceremony runs. Labels are empty, so the lines pay the contacts under whatever names
+# the book has now (after a rename too).
+address,amount_sat,label
+tsp1qqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpjqeyv5l2cs6y3qqzesrth7mlzrlp3xg7xhulusczm04x6g6nms9trs7l065l,2500,
+tsp1qqwa0w6yupg6437mqgkysx65dre9kshvsnahqutrqrzs5qjdwvnkzvq5urav942q8vtulg3v0dqrf0zmma76xc7mg47pd8xtrq7fl7x3t2qcv4pl7,2500,

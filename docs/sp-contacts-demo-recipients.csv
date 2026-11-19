@@ -1,0 +1,8 @@
+# Sample batch for the SP contacts demo (signet only). See docs/sp-contacts-demo.md.
+# address,amount_sat[,label]. A new silent payment address needs a label: it becomes the contact's name.
+address,amount_sat,label
+tsp1qqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpjqeyv5l2cs6y3qqzesrth7mlzrlp3xg7xhulusczm04x6g6nms9trs7l065l,5000,Alice
+tsp1qqwa0w6yupg6437mqgkysx65dre9kshvsnahqutrqrzs5qjdwvnkzvq5urav942q8vtulg3v0dqrf0zmma76xc7mg47pd8xtrq7fl7x3t2qcv4pl7,4000,Bob
+tb1psdtsegea2qk73flpteveslqcp4utjl5z0l8axst7y9wyq2h75txsv4qeh2,3000,
+# To also pay a contact the wallet already has, add its address with an empty label (or its exact name):
+# <existing contact's tsp1 address>,2000,

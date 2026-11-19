@@ -386,6 +386,60 @@ simulate +ARGS="":
 # Run desktop device simulator
 sim-device STATE +ARGS="":
     cargo run -p device_simulator -- --state {{STATE}} --firmware target/riscv32imc-unknown-none-elf/release/{{env}}-frontier.bin {{ARGS}}
+# Dev tooling, not for merge (docs/sp-contacts-demo.md). Needs the RISC-V toolchain for the
+# firmware image, as build-firmware does. Ctrl-C stops everything.
+# SP contacts demo: a local relay, three simulated devices and three app instances
+demo-sp-contacts DIR="$HOME/tmp/frostsnap-sp-demo" PORT="7777": maybe-gen
+    #!/bin/sh
+    set -e
+    DIR="{{DIR}}"
+    mkdir -p "$DIR/logs"
+    # The app and the simulators must announce the same firmware digest, so both use this image.
+    just build-firmware {{default_board}}
+    case "$(espflash --version)" in
+        "espflash 3."*) just save-image {{default_board}} ;;
+        *) just save-image {{default_board}} --ignore-app-descriptor ;;
+    esac
+    FIRMWARE="$PWD/target/riscv32imc-unknown-none-elf/release/{{default_board}}.bin"
+    cargo build -p device_simulator
+    cargo build -p frostsnap_nostr --example local_relay
+    TARGET=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+    BUILD_COMMIT=$(just get-build-commit)
+    BUILD_VERSION=$(just get-build-version)
+    (cd frostsnapp && FROSTSNAP_ENV={{env}} BUNDLE_FIRMWARE="$FIRMWARE" flutter build macos --debug \
+        --dart-define=BUILD_COMMIT="$BUILD_COMMIT" --dart-define=BUILD_VERSION="$BUILD_VERSION")
+    cleanup() {
+        pkill -f -- "--data-dir=$DIR/app" 2>/dev/null || true
+        pkill -f -- "--state $DIR/dev" 2>/dev/null || true
+        [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+    "$TARGET/debug/examples/local_relay" {{PORT}} > "$DIR/logs/relay.log" 2>&1 &
+    RELAY_PID=$!
+    echo "ws://127.0.0.1:{{PORT}}" > "$DIR/relay"
+    for i in 1 2 3; do
+        "$TARGET/debug/device_simulator" --state "$DIR/dev$i.state" --firmware "$FIRMWARE" > "$DIR/logs/dev$i.log" 2>&1 &
+    done
+    for i in 1 2 3; do
+        until grep -q "SIM PORT" "$DIR/logs/dev$i.log" 2>/dev/null; do sleep 0.2; done
+        sed -n 's/^SIM PORT //p' "$DIR/logs/dev$i.log" | head -1 > "$DIR/dev$i.port"
+        echo "device $i: $(cat "$DIR/dev$i.port")"
+    done
+    for i in 1 2 3; do
+        just demo-sp-app $i "$DIR" &
+    done
+    echo "relay $(cat "$DIR/relay"), logs in $DIR/logs. Ctrl-C stops everything."
+    wait
+
+# Dev tooling, not for merge (docs/sp-contacts-demo.md).
+# Start app N of the SP contacts demo again, on the demo's relay and simulated device
+demo-sp-app N DIR="$HOME/tmp/frostsnap-sp-demo":
+    #!/bin/sh
+    DIR="{{DIR}}"
+    APP=frostsnapp/build/macos/Build/Products/Debug/Frostsnap.app/Contents/MacOS/Frostsnap
+    exec env FROSTSNAP_SIM_PORTS="$(cat "$DIR/dev{{N}}.port")" FROSTSNAP_NOSTR_RELAYS="$(cat "$DIR/relay")" \
+        "$APP" --data-dir="$DIR/app{{N}}" >> "$DIR/logs/app{{N}}.log" 2>&1
+
 stack-check +ARGS="stacks --max-pct 25":
     @rustup toolchain list | grep -q '^nightly' || { echo "error: nightly toolchain not installed. Run: rustup toolchain install nightly" >&2; exit 1; }
     @rustup component list --installed --toolchain nightly | grep -q '^rust-src' || { echo "error: rust-src component missing on nightly (needed for -Z build-std). Run: rustup component add rust-src --toolchain nightly" >&2; exit 1; }
