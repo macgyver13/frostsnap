@@ -1,13 +1,15 @@
 mod events;
+#[cfg(test)]
+mod test_group;
 mod tree;
 
 pub use events::{
-    ChannelEvent, ChannelParticipant, ConfirmedSubsetEntry, ConnectionState, GroupMember,
-    ObservationKind, SigningEvent,
+    ChannelEvent, ChannelParticipant, ConfirmedSubsetEntry, ConnectionState, ContactEvent,
+    ContactOfferEntry, GroupMember, ObservationKind, SigningEvent,
 };
 use events::{ReceiveAddressPayload, SigningMessage};
 
-use self::tree::{SigningEventTree, TimerAction, WireEvent};
+use self::tree::{SigningEventTree, TimerAction, TreeEvent, WireEvent};
 use crate::EventId;
 use crate::{
     channel::ChannelKeys,
@@ -19,7 +21,11 @@ use crate::{
 use anyhow::{anyhow, Result};
 use frostsnap_coordinator::Sink;
 use frostsnap_core::{
-    coordinator::{KeyContext, ParticipantBinonces, ParticipantSignatureShares},
+    coordinator::{
+        remote_sp_contact::SpContactOffer, KeyContext, ParticipantBinonces,
+        ParticipantSignatureShares,
+    },
+    silent_payments::ContactChangeSet,
     WireSignTask,
 };
 use nostr_sdk::{Client, Event, Keys, Kind};
@@ -48,6 +54,7 @@ pub struct ChannelClient {
     key_context: KeyContext,
     init_data: Option<crate::ChannelInitData>,
     settling_window: Duration,
+    contact_sink: Option<Box<dyn Sink<ContactEvent>>>,
 }
 
 impl ChannelClient {
@@ -59,7 +66,15 @@ impl ChannelClient {
             key_context,
             init_data,
             settling_window: DEFAULT_SETTLING_WINDOW,
+            contact_sink: None,
         }
+    }
+
+    /// Where the contact change set ceremony's events go. Without one they are folded and
+    /// dropped.
+    pub fn with_contact_sink(mut self, sink: impl Sink<ContactEvent>) -> Self {
+        self.contact_sink = Some(Box::new(sink));
+        self
     }
 
     /// Override the settling window (how long to wait for more offers before
@@ -101,6 +116,10 @@ impl ChannelClient {
         let runner_handle_for_task = runner_handle.clone();
         let key_context = self.key_context.clone();
         let settling_window = self.settling_window;
+        let contact_sink: Box<dyn Sink<ContactEvent>> = match self.contact_sink {
+            Some(contact_sink) => contact_sink,
+            None => Box::new(()),
+        };
         tokio::spawn(async move {
             let mut tree = SigningEventTree::new(key_context, settling_window);
             let mut timers: HashMap<EventId, Instant> = HashMap::new();
@@ -202,6 +221,7 @@ impl ChannelClient {
                                                 timer_acts,
                                                 false,
                                                 &sink,
+                                                &*contact_sink,
                                                 &mut timers,
                                                 &mut activity,
                                             );
@@ -278,12 +298,13 @@ impl ChannelClient {
                     }
                     Some(request_id) = next_timer(&timers) => {
                         timers.remove(&request_id);
-                        if let Some(signing_event) = tree.timer_expired(request_id)
-                        {
-                            sink.send(ChannelEvent::Signing {
-                                event: signing_event,
+                        match tree.timer_expired(request_id) {
+                            Some(TreeEvent::Signing(event)) => sink.send(ChannelEvent::Signing {
+                                event,
                                 pending: false,
-                            });
+                            }),
+                            Some(TreeEvent::Contact(event)) => contact_sink.send(event),
+                            None => {}
                         }
                     }
                 }
@@ -451,6 +472,32 @@ impl ChannelHandle {
             .await
     }
 
+    /// Ask the group to confirm a contact change set. The request's event id is the ceremony's
+    /// `SpContactSessionId` on every member.
+    pub async fn send_contact_request(
+        &self,
+        keys: &Keys,
+        set: ContactChangeSet,
+    ) -> Result<EventId> {
+        let message = SigningMessage::ContactRequest { set };
+        self.send_signing_event(keys, &message, None).await
+    }
+
+    /// Publish this member's offer for a contact request, once its device confirmed the set.
+    pub async fn send_contact_offer(
+        &self,
+        keys: &Keys,
+        request_id: EventId,
+        offer: SpContactOffer,
+    ) -> Result<EventId> {
+        let message = SigningMessage::ContactOffer {
+            binonces: offer.participant_binonces,
+            shares: offer.shares,
+        };
+        self.send_signing_event(keys, &message, Some(request_id))
+            .await
+    }
+
     pub async fn send_sign_cancel(&self, keys: &Keys, request_id: EventId) -> Result<EventId> {
         let message = SigningMessage::Cancel;
         self.send_signing_event(keys, &message, Some(request_id))
@@ -528,7 +575,7 @@ fn next_timer(
 fn process_signing_inner_event(
     inner_event: &Event,
     tree: &mut SigningEventTree,
-) -> Result<(Vec<SigningEvent>, Vec<TimerAction>), ChannelEvent> {
+) -> Result<(Vec<TreeEvent>, Vec<TimerAction>), ChannelEvent> {
     let meta = EventMeta::from_event(inner_event);
 
     let err = |reason: String| ChannelEvent::Error {
@@ -569,6 +616,21 @@ fn process_signing_inner_event(
             let request_id = extract_e_tag(inner_event)
                 .ok_or_else(|| err("signing cancel missing e-tag".into()))?;
             WireEvent::Cancel { request_id }
+        }
+        SigningMessage::RetiredSpOffer => {
+            return Err(err("retired silent payment offer".into()));
+        }
+        SigningMessage::ContactRequest { set } => WireEvent::ContactRequest { set },
+        SigningMessage::ContactOffer { binonces, shares } => {
+            let request_id = extract_e_tag(inner_event)
+                .ok_or_else(|| err("contact offer missing e-tag".into()))?;
+            WireEvent::ContactOffer {
+                request_id,
+                offer: SpContactOffer {
+                    participant_binonces: binonces,
+                    shares,
+                },
+            }
         }
     };
 
@@ -684,14 +746,22 @@ fn handle_notify_tx_observed(
 /// `SigningEvent::Request` entries into `activity.signing_starts_by_txid`
 /// for chat→tx correlation on later wallet observations.
 fn dispatch_signing_output(
-    signing_events: Vec<SigningEvent>,
+    tree_events: Vec<TreeEvent>,
     timer_actions: Vec<TimerAction>,
     pending: bool,
     sink: &impl Sink<ChannelEvent>,
+    contact_sink: &dyn Sink<ContactEvent>,
     timers: &mut HashMap<EventId, Instant>,
     activity: &mut ActivityState,
 ) {
-    for (i, event) in signing_events.into_iter().enumerate() {
+    for (i, event) in tree_events.into_iter().enumerate() {
+        let event = match event {
+            TreeEvent::Signing(event) => event,
+            TreeEvent::Contact(event) => {
+                contact_sink.send(event);
+                continue;
+            }
+        };
         if let SigningEvent::Request {
             event_id,
             sign_task: frostsnap_core::WireSignTask::BitcoinTransaction(template),

@@ -18,17 +18,27 @@
 //! alongside [`SigningEvent`]s that the outer event loop translates into
 //! `tokio::time` state.
 //!
+//! A contact request (a change set for the wallet's shared contact book) is
+//! folded the same way. Its offers carry the device's ECDH shares and proofs,
+//! which are checked when they arrive, and the task its subset signs is the
+//! change set completed from the subset's shares. Its events go out as
+//! [`ContactEvent`]s.
+//!
 //! Partials and Cancels keep their DAG-orphan buffering semantics from the
 //! prior chain-based design: if a partial/cancel arrives before its
 //! request, it's stashed and replayed when the request lands.
 
-use super::events::{ConfirmedSubsetEntry, SigningEvent};
+use super::events::{ConfirmedSubsetEntry, ContactEvent, ContactOfferEntry, SigningEvent};
 use crate::channel_runner::EventMeta;
 use crate::{EventId, PublicKey};
 use frostsnap_core::{
-    coordinator::{KeyContext, ParticipantBinonces, ParticipantSignatureShares},
+    coordinator::{
+        remote_sp_contact::{sp_contact_sign_task, SpContactOffer},
+        KeyContext, ParticipantBinonces, ParticipantSignatureShares,
+    },
     message::GroupSignReq,
     schnorr_fun::frost::ShareIndex,
+    silent_payments::ContactChangeSet,
     WireSignTask,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -43,9 +53,28 @@ pub(crate) struct SigningEventTree {
     settling_window: std::time::Duration,
 }
 
+/// What a request asks the group for. A contact round is folded like a signing round, but its
+/// offers carry ECDH shares and the task its subset signs is completed from them.
+#[derive(Clone)]
+enum RequestKind {
+    Sign(WireSignTask),
+    Contact(ContactChangeSet),
+}
+
+/// An event the tree emits: signing rounds go to the chat's sink, contact rounds to the contact
+/// sink.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum TreeEvent {
+    Signing(SigningEvent),
+    Contact(ContactEvent),
+}
+
 struct RequestState {
     author: PublicKey,
-    sign_task: WireSignTask,
+    kind: RequestKind,
+    /// The offers of a contact round, by event id, as they arrived.
+    contact_offers: HashMap<EventId, SpContactOffer>,
     /// Stored `ConfirmedSubsetEntry` because that's exactly what the
     /// `RoundConfirmed` emission needs — {event_id, author, timestamp,
     /// binonces}. Storing it in final shape saves a conversion.
@@ -75,6 +104,13 @@ pub(crate) enum WireEvent {
     Offer {
         request_id: EventId,
         binonces: Vec<ParticipantBinonces>,
+    },
+    ContactRequest {
+        set: ContactChangeSet,
+    },
+    ContactOffer {
+        request_id: EventId,
+        offer: SpContactOffer,
     },
     Partial {
         request_id: EventId,
@@ -118,86 +154,125 @@ impl SigningEventTree {
     }
 
     /// Ingest one decoded wire event (with its outer-nostr metadata) and
-    /// return the signing events + timer actions it unlocks, in DAG-valid
+    /// return the events + timer actions it unlocks, in DAG-valid
     /// order (ancestor before descendant).
     ///
     /// When the event is stashed (missing ancestor), both Vecs are empty.
-    /// When it's processed, the first `SigningEvent` corresponds to this
+    /// When it's processed, the first event corresponds to this
     /// event. Orphan cascades may append further events from previously
     /// stashed items.
     pub(crate) fn ingest_wire(
         &mut self,
         meta: EventMeta,
         wire: WireEvent,
-    ) -> (Vec<SigningEvent>, Vec<TimerAction>) {
+    ) -> (Vec<TreeEvent>, Vec<TimerAction>) {
         let mut events = Vec::new();
         let mut timers = Vec::new();
         let mut queue: VecDeque<(EventMeta, WireEvent)> = VecDeque::new();
         queue.push_back((meta, wire));
 
         while let Some((meta, wire)) = queue.pop_front() {
+            let rejected = |is_contact: bool, reason: String| {
+                if is_contact {
+                    TreeEvent::Contact(ContactEvent::Rejected {
+                        event_id: meta.event_id,
+                        author: meta.author,
+                        timestamp: meta.timestamp,
+                        reason,
+                    })
+                } else {
+                    TreeEvent::Signing(SigningEvent::Rejected {
+                        event_id: meta.event_id,
+                        author: meta.author,
+                        timestamp: meta.timestamp,
+                        reason,
+                    })
+                }
+            };
             match wire {
                 WireEvent::Request { sign_task, message } => {
-                    self.requests.insert(
-                        meta.event_id,
-                        RequestState {
-                            author: meta.author,
-                            sign_task: sign_task.clone(),
-                            offers: HashMap::new(),
-                            seen_share_indices: BTreeSet::new(),
-                            confirmed: false,
-                            cancelled: false,
-                        },
-                    );
-                    events.push(SigningEvent::Request {
+                    self.insert_request(&meta, RequestKind::Sign(sign_task.clone()));
+                    events.push(TreeEvent::Signing(SigningEvent::Request {
                         event_id: meta.event_id,
                         author: meta.author,
                         sign_task,
                         message,
                         timestamp: meta.timestamp,
-                    });
+                    }));
                     self.drain_pending_into(meta.event_id, &mut queue);
                 }
-                WireEvent::Offer {
-                    request_id,
-                    binonces,
-                } => {
+                WireEvent::ContactRequest { set } => {
+                    self.insert_request(&meta, RequestKind::Contact(set.clone()));
+                    events.push(TreeEvent::Contact(ContactEvent::Request {
+                        event_id: meta.event_id,
+                        author: meta.author,
+                        set,
+                        timestamp: meta.timestamp,
+                    }));
+                    self.drain_pending_into(meta.event_id, &mut queue);
+                }
+                wire @ (WireEvent::Offer { .. } | WireEvent::ContactOffer { .. }) => {
+                    let is_contact_offer = matches!(wire, WireEvent::ContactOffer { .. });
+                    let (request_id, binonces) = match &wire {
+                        WireEvent::Offer {
+                            request_id,
+                            binonces,
+                        } => (*request_id, binonces.clone()),
+                        WireEvent::ContactOffer { request_id, offer } => {
+                            (*request_id, vec![offer.participant_binonces.clone()])
+                        }
+                        _ => unreachable!("matched above"),
+                    };
+                    let key_context = self.key_context.clone();
                     let Some(state) = self.requests.get_mut(&request_id) else {
                         tracing::debug!(
                             event_id = %meta.event_id,
                             request_id = %request_id,
                             "signing offer stashed pending request",
                         );
-                        self.pending.entry(request_id).or_default().push((
-                            meta,
-                            WireEvent::Offer {
-                                request_id,
-                                binonces,
-                            },
-                        ));
+                        self.pending
+                            .entry(request_id)
+                            .or_default()
+                            .push((meta, wire));
                         continue;
                     };
+                    let is_contact = matches!(state.kind, RequestKind::Contact(_));
 
                     if state.confirmed || state.cancelled {
-                        events.push(SigningEvent::Rejected {
-                            event_id: meta.event_id,
-                            author: meta.author,
-                            timestamp: meta.timestamp,
-                            reason: "offer arrived after round was decided".into(),
-                        });
+                        events.push(rejected(
+                            is_contact,
+                            "offer arrived after round was decided".into(),
+                        ));
                         continue;
+                    }
+
+                    if is_contact != is_contact_offer {
+                        events.push(rejected(
+                            is_contact,
+                            "offer is not the kind its request asks for".into(),
+                        ));
+                        continue;
+                    }
+
+                    // An offer whose shares do not check is dropped before it can take its share
+                    // index, so it can neither enter the subset nor block an honest offer.
+                    if let (RequestKind::Contact(set), WireEvent::ContactOffer { offer, .. }) =
+                        (&state.kind, &wire)
+                    {
+                        if let Err(reason) = offer.check(&key_context, set) {
+                            events.push(rejected(true, format!("contact offer refused: {reason}")));
+                            continue;
+                        }
                     }
 
                     let new_share_indices: BTreeSet<ShareIndex> =
                         binonces.iter().map(|b| b.share_index).collect();
                     let collision = !state.seen_share_indices.is_disjoint(&new_share_indices);
                     if collision {
-                        events.push(SigningEvent::Rejected {
-                            event_id: meta.event_id,
-                            author: meta.author,
-                            timestamp: meta.timestamp,
-                            reason: "offer contains a share_index already seen this round".into(),
-                        });
+                        events.push(rejected(
+                            is_contact,
+                            "offer contains a share_index already seen this round".into(),
+                        ));
                         continue;
                     }
 
@@ -216,13 +291,25 @@ impl SigningEventTree {
                         request_id,
                         duration: self.settling_window,
                     });
-                    events.push(SigningEvent::Offer {
-                        event_id: meta.event_id,
-                        author: meta.author,
-                        request_id,
-                        binonces,
-                        timestamp: meta.timestamp,
-                    });
+                    match wire {
+                        WireEvent::ContactOffer { offer, .. } => {
+                            state.contact_offers.insert(meta.event_id, offer.clone());
+                            events.push(TreeEvent::Contact(ContactEvent::Offer {
+                                event_id: meta.event_id,
+                                author: meta.author,
+                                request_id,
+                                offer,
+                                timestamp: meta.timestamp,
+                            }));
+                        }
+                        _ => events.push(TreeEvent::Signing(SigningEvent::Offer {
+                            event_id: meta.event_id,
+                            author: meta.author,
+                            request_id,
+                            binonces,
+                            timestamp: meta.timestamp,
+                        })),
+                    }
                     self.drain_pending_into(meta.event_id, &mut queue);
                 }
                 WireEvent::Partial {
@@ -246,24 +333,21 @@ impl SigningEventTree {
                         ));
                         continue;
                     };
+                    let is_contact = matches!(state.kind, RequestKind::Contact(_));
 
                     if offer_subset.is_empty() {
-                        events.push(SigningEvent::Rejected {
-                            event_id: meta.event_id,
-                            author: meta.author,
-                            timestamp: meta.timestamp,
-                            reason: "partial has empty offer_subset".into(),
-                        });
+                        events.push(rejected(
+                            is_contact,
+                            "partial has empty offer_subset".into(),
+                        ));
                         continue;
                     }
                     let dedup: BTreeSet<EventId> = offer_subset.iter().copied().collect();
                     if dedup.len() != offer_subset.len() {
-                        events.push(SigningEvent::Rejected {
-                            event_id: meta.event_id,
-                            author: meta.author,
-                            timestamp: meta.timestamp,
-                            reason: "partial offer_subset has duplicates".into(),
-                        });
+                        events.push(rejected(
+                            is_contact,
+                            "partial offer_subset has duplicates".into(),
+                        ));
                         continue;
                     }
 
@@ -293,32 +377,55 @@ impl SigningEventTree {
                         .flat_map(|oid| state.offers[oid].binonces.iter().cloned())
                         .collect();
 
+                    // A contact partial signs the task its subset's shares complete.
+                    let sign_task = match state.sign_task(&self.key_context, &offer_subset) {
+                        Ok(sign_task) => sign_task,
+                        Err(reason) => {
+                            events.push(rejected(
+                                is_contact,
+                                format!("partial's offers do not complete the task: {reason}"),
+                            ));
+                            continue;
+                        }
+                    };
                     let session_id = GroupSignReq::from_binonces(
-                        state.sign_task.clone(),
+                        sign_task.clone(),
                         self.key_context.access_structure_id(),
                         &resolved_binonces,
                     )
                     .session_id();
 
-                    events.push(SigningEvent::Partial {
-                        event_id: meta.event_id,
-                        author: meta.author,
-                        request_id,
-                        offer_subset,
-                        session_id,
-                        signature_shares,
-                        timestamp: meta.timestamp,
+                    events.push(if is_contact {
+                        TreeEvent::Contact(ContactEvent::Partial {
+                            event_id: meta.event_id,
+                            author: meta.author,
+                            request_id,
+                            offer_subset,
+                            session_id,
+                            sign_task,
+                            signature_shares,
+                            timestamp: meta.timestamp,
+                        })
+                    } else {
+                        TreeEvent::Signing(SigningEvent::Partial {
+                            event_id: meta.event_id,
+                            author: meta.author,
+                            request_id,
+                            offer_subset,
+                            session_id,
+                            signature_shares,
+                            timestamp: meta.timestamp,
+                        })
                     });
                 }
                 WireEvent::Cancel { request_id } => match self.requests.get_mut(&request_id) {
                     Some(state) => {
+                        let is_contact = matches!(state.kind, RequestKind::Contact(_));
                         if state.author != meta.author {
-                            events.push(SigningEvent::Rejected {
-                                event_id: meta.event_id,
-                                author: meta.author,
-                                timestamp: meta.timestamp,
-                                reason: "cancel from non-request-author".into(),
-                            });
+                            events.push(rejected(
+                                is_contact,
+                                "cancel from non-request-author".into(),
+                            ));
                             continue;
                         }
                         let still_collecting = !state.confirmed && !state.cancelled;
@@ -326,11 +433,20 @@ impl SigningEventTree {
                             state.cancelled = true;
                             timers.push(TimerAction::Cancel { request_id });
                         }
-                        events.push(SigningEvent::Cancel {
-                            event_id: meta.event_id,
-                            author: meta.author,
-                            request_id,
-                            timestamp: meta.timestamp,
+                        events.push(if is_contact {
+                            TreeEvent::Contact(ContactEvent::Cancel {
+                                event_id: meta.event_id,
+                                author: meta.author,
+                                request_id,
+                                timestamp: meta.timestamp,
+                            })
+                        } else {
+                            TreeEvent::Signing(SigningEvent::Cancel {
+                                event_id: meta.event_id,
+                                author: meta.author,
+                                request_id,
+                                timestamp: meta.timestamp,
+                            })
                         });
                     }
                     None => {
@@ -350,13 +466,29 @@ impl SigningEventTree {
         (events, timers)
     }
 
-    pub(crate) fn timer_expired(&mut self, request_id: EventId) -> Option<SigningEvent> {
+    fn insert_request(&mut self, meta: &EventMeta, kind: RequestKind) {
+        self.requests.insert(
+            meta.event_id,
+            RequestState {
+                author: meta.author,
+                kind,
+                contact_offers: HashMap::new(),
+                offers: HashMap::new(),
+                seen_share_indices: BTreeSet::new(),
+                confirmed: false,
+                cancelled: false,
+            },
+        );
+    }
+
+    pub(crate) fn timer_expired(&mut self, request_id: EventId) -> Option<TreeEvent> {
         let threshold = self.threshold();
         let access_structure_id = self.key_context.access_structure_id();
         let state = self.requests.get_mut(&request_id)?;
         if state.confirmed || state.cancelled {
             return None;
         }
+        let is_contact = matches!(state.kind, RequestKind::Contact(_));
 
         let observed_count = state.offers.len();
         if observed_count < threshold {
@@ -367,11 +499,21 @@ impl SigningEventTree {
             // final confirmed subset unless an offer with an earlier
             // timestamp arrives later. Do not change state.
             let observed: Vec<EventId> = state.offers.keys().copied().collect();
-            return Some(SigningEvent::RoundPending {
-                request_id,
-                observed,
-                threshold,
-                timestamp: now_seconds(),
+            let timestamp = now_seconds();
+            return Some(if is_contact {
+                TreeEvent::Contact(ContactEvent::RoundPending {
+                    request_id,
+                    observed,
+                    threshold,
+                    timestamp,
+                })
+            } else {
+                TreeEvent::Signing(SigningEvent::RoundPending {
+                    request_id,
+                    observed,
+                    threshold,
+                    timestamp,
+                })
             });
         }
 
@@ -383,20 +525,44 @@ impl SigningEventTree {
             .iter()
             .flat_map(|rec| rec.binonces.iter().cloned())
             .collect();
-        let session_id = GroupSignReq::from_binonces(
-            state.sign_task.clone(),
-            access_structure_id,
-            &selected_binonces,
-        )
-        .session_id();
+        let subset_ids: Vec<EventId> = subset.iter().map(|entry| entry.event_id).collect();
+        let sign_task = match state.sign_task(&self.key_context, &subset_ids) {
+            Ok(sign_task) => sign_task,
+            Err(reason) => {
+                // Every offer checked on arrival, so their shares combine.
+                tracing::error!(%request_id, %reason, "confirmed offers do not complete the task");
+                return None;
+            }
+        };
+        let session_id =
+            GroupSignReq::from_binonces(sign_task.clone(), access_structure_id, &selected_binonces)
+                .session_id();
 
         state.confirmed = true;
-        Some(SigningEvent::RoundConfirmed {
-            request_id,
-            subset,
-            session_id,
-            sign_task: state.sign_task.clone(),
-            timestamp: now_seconds(),
+        let timestamp = now_seconds();
+        Some(match &state.kind {
+            RequestKind::Sign(_) => TreeEvent::Signing(SigningEvent::RoundConfirmed {
+                request_id,
+                subset,
+                session_id,
+                sign_task,
+                timestamp,
+            }),
+            RequestKind::Contact(_) => TreeEvent::Contact(ContactEvent::RoundConfirmed {
+                request_id,
+                subset: subset
+                    .into_iter()
+                    .map(|entry| ContactOfferEntry {
+                        offer: state.contact_offers[&entry.event_id].clone(),
+                        event_id: entry.event_id,
+                        author: entry.author,
+                        timestamp: entry.timestamp,
+                    })
+                    .collect(),
+                session_id,
+                sign_task,
+                timestamp,
+            }),
         })
     }
 
@@ -412,6 +578,23 @@ impl SigningEventTree {
                 "releasing stashed signing events",
             );
             queue.extend(drained);
+        }
+    }
+}
+
+impl RequestState {
+    /// The task the offers `subset` sign: the requested one for a signing round, and for a contact
+    /// round the change set completed from the subset's shares.
+    fn sign_task(&self, key: &KeyContext, subset: &[EventId]) -> Result<WireSignTask, String> {
+        match &self.kind {
+            RequestKind::Sign(sign_task) => Ok(sign_task.clone()),
+            RequestKind::Contact(set) => {
+                let offers = subset
+                    .iter()
+                    .map(|event_id| self.contact_offers[event_id].clone())
+                    .collect::<Vec<_>>();
+                sp_contact_sign_task(key, set.clone(), &offers).map_err(|e| format!("{e:?}"))
+            }
         }
     }
 }
@@ -571,21 +754,53 @@ mod tests {
     fn ingest_tuple(
         tree: &mut SigningEventTree,
         pair: (EventMeta, WireEvent),
-    ) -> (Vec<SigningEvent>, Vec<TimerAction>) {
+    ) -> (Vec<TreeEvent>, Vec<TimerAction>) {
         tree.ingest_wire(pair.0, pair.1)
     }
 
-    fn event_ids(events: &[SigningEvent]) -> Vec<(EventId, &'static str)> {
+    fn signing(event: TreeEvent) -> SigningEvent {
+        match event {
+            TreeEvent::Signing(event) => event,
+            TreeEvent::Contact(event) => panic!("expected a signing event, got {event:?}"),
+        }
+    }
+
+    fn event_ids(events: &[TreeEvent]) -> Vec<(EventId, &'static str)> {
         events
             .iter()
             .map(|e| match e {
-                SigningEvent::Request { event_id, .. } => (*event_id, "Request"),
-                SigningEvent::Offer { event_id, .. } => (*event_id, "Offer"),
-                SigningEvent::Partial { event_id, .. } => (*event_id, "Partial"),
-                SigningEvent::Cancel { event_id, .. } => (*event_id, "Cancel"),
-                SigningEvent::RoundConfirmed { request_id, .. } => (*request_id, "RoundConfirmed"),
-                SigningEvent::RoundPending { request_id, .. } => (*request_id, "RoundPending"),
-                SigningEvent::Rejected { event_id, .. } => (*event_id, "Rejected"),
+                TreeEvent::Contact(ContactEvent::Request { event_id, .. }) => {
+                    (*event_id, "ContactRequest")
+                }
+                TreeEvent::Contact(ContactEvent::Offer { event_id, .. }) => {
+                    (*event_id, "ContactOffer")
+                }
+                TreeEvent::Contact(ContactEvent::RoundConfirmed { request_id, .. }) => {
+                    (*request_id, "ContactRoundConfirmed")
+                }
+                TreeEvent::Contact(ContactEvent::RoundPending { request_id, .. }) => {
+                    (*request_id, "ContactRoundPending")
+                }
+                TreeEvent::Contact(ContactEvent::Partial { event_id, .. }) => {
+                    (*event_id, "ContactPartial")
+                }
+                TreeEvent::Contact(ContactEvent::Cancel { event_id, .. }) => {
+                    (*event_id, "ContactCancel")
+                }
+                TreeEvent::Contact(ContactEvent::Rejected { event_id, .. }) => {
+                    (*event_id, "ContactRejected")
+                }
+                TreeEvent::Signing(e) => match e {
+                    SigningEvent::Request { event_id, .. } => (*event_id, "Request"),
+                    SigningEvent::Offer { event_id, .. } => (*event_id, "Offer"),
+                    SigningEvent::Partial { event_id, .. } => (*event_id, "Partial"),
+                    SigningEvent::Cancel { event_id, .. } => (*event_id, "Cancel"),
+                    SigningEvent::RoundConfirmed { request_id, .. } => {
+                        (*request_id, "RoundConfirmed")
+                    }
+                    SigningEvent::RoundPending { request_id, .. } => (*request_id, "RoundPending"),
+                    SigningEvent::Rejected { event_id, .. } => (*event_id, "Rejected"),
+                },
             })
             .collect()
     }
@@ -627,7 +842,7 @@ mod tests {
         let r = eid(1);
         let _ = ingest_tuple(&mut tree, req(r, pk(), 100));
         let _ = ingest_tuple(&mut tree, offer_with(eid(2), r, pk(), 200, 1));
-        match tree.timer_expired(r).unwrap() {
+        match signing(tree.timer_expired(r).unwrap()) {
             SigningEvent::RoundPending {
                 observed,
                 threshold,
@@ -643,7 +858,7 @@ mod tests {
         // confirm normally.
         let _ = ingest_tuple(&mut tree, offer_with(eid(3), r, pk(), 210, 2));
         let _ = ingest_tuple(&mut tree, offer_with(eid(4), r, pk(), 220, 3));
-        match tree.timer_expired(r).unwrap() {
+        match signing(tree.timer_expired(r).unwrap()) {
             SigningEvent::RoundConfirmed { subset, .. } => {
                 assert_eq!(subset.len(), 3);
             }
@@ -658,7 +873,7 @@ mod tests {
         let _ = ingest_tuple(&mut tree, req(r, pk(), 100));
         let _ = ingest_tuple(&mut tree, offer_with(eid(2), r, pk(), 200, 1));
         let _ = ingest_tuple(&mut tree, offer_with(eid(3), r, pk(), 210, 2));
-        match tree.timer_expired(r).unwrap() {
+        match signing(tree.timer_expired(r).unwrap()) {
             SigningEvent::RoundConfirmed { subset, .. } => {
                 assert_eq!(subset.len(), 2);
                 assert_eq!(subset[0].event_id, eid(2));
@@ -677,7 +892,7 @@ mod tests {
         let _ = ingest_tuple(&mut tree, offer_with(eid(4), r, pk(), 200, 1));
         let _ = ingest_tuple(&mut tree, offer_with(eid(3), r, pk(), 150, 2));
         let _ = ingest_tuple(&mut tree, offer_with(eid(5), r, pk(), 160, 3));
-        match tree.timer_expired(r).unwrap() {
+        match signing(tree.timer_expired(r).unwrap()) {
             SigningEvent::RoundConfirmed { subset, .. } => {
                 assert_eq!(subset.len(), 2);
                 assert_eq!(subset[0].event_id, eid(3));
@@ -695,7 +910,7 @@ mod tests {
         let _ = ingest_tuple(&mut tree, offer_with(eid(5), r, pk(), 200, 1));
         let _ = ingest_tuple(&mut tree, offer_with(eid(3), r, pk(), 200, 2));
         let _ = ingest_tuple(&mut tree, offer_with(eid(4), r, pk(), 200, 3));
-        match tree.timer_expired(r).unwrap() {
+        match signing(tree.timer_expired(r).unwrap()) {
             SigningEvent::RoundConfirmed { subset, .. } => {
                 assert_eq!(subset[0].event_id, eid(3));
                 assert_eq!(subset[1].event_id, eid(4));
@@ -834,13 +1049,13 @@ mod tests {
         let _ = ingest_tuple(&mut tree, offer_with(eid(3), ra, pk(), 110, 1));
         let _ = ingest_tuple(&mut tree, offer_with(eid(4), ra, pk(), 120, 2));
         assert!(matches!(
-            tree.timer_expired(ra).unwrap(),
+            signing(tree.timer_expired(ra).unwrap()),
             SigningEvent::RoundConfirmed { .. }
         ));
         // rb never got any offers; below-threshold timer fires emit
         // RoundPending with an empty observed set, not a decision.
         assert!(matches!(
-            tree.timer_expired(rb).unwrap(),
+            signing(tree.timer_expired(rb).unwrap()),
             SigningEvent::RoundPending { .. }
         ));
     }
@@ -867,5 +1082,200 @@ mod tests {
         let _ = ingest_tuple(&mut tree, offer_with(eid(3), r, pk(), 210, 2));
         let _ = tree.timer_expired(r);
         assert!(tree.timer_expired(r).is_none());
+    }
+}
+
+#[cfg(test)]
+mod contact_tests {
+    use super::*;
+    use crate::signing::test_group::{details, Group};
+    use frostsnap_core::message::signing::SpContactSessionId;
+    use frostsnap_core::silent_payments::{ContactChange, ContactChangeSet};
+    use nostr_sdk::Keys;
+
+    const SETTLING: std::time::Duration = std::time::Duration::from_secs(4);
+
+    fn eid(n: u8) -> EventId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = n;
+        EventId(bytes)
+    }
+
+    fn meta(event_id: EventId, author: PublicKey, timestamp: u64) -> EventMeta {
+        EventMeta {
+            event_id,
+            author,
+            timestamp,
+        }
+    }
+
+    fn pk() -> PublicKey {
+        Keys::generate().public_key().into()
+    }
+
+    /// A 2-of-3 group with a change set of two adds confirmed by all three devices.
+    fn confirmed_offers() -> (Group, ContactChangeSet, [SpContactOffer; 3]) {
+        let mut group = Group::new(2);
+        let set = ContactChangeSet {
+            head: group.run.participants[0]
+                .coordinator
+                .sp_contact_book_head(group.key_id()),
+            changes: vec![
+                ContactChange::Add(details("Ann", 0x11, 0x12)),
+                ContactChange::Add(details("Ben", 0x13, 0x14)),
+            ],
+        };
+        let session_id = SpContactSessionId(eid(1).0);
+        let offers = [0, 1, 2].map(|ci| group.confirm(ci, session_id, &set));
+        (group, set, offers)
+    }
+
+    /// The round confirms the two oldest offers, its task is the set completed from their shares,
+    /// and a partial over that subset belongs to the same session.
+    #[test]
+    fn a_contact_round_confirms_the_task_its_subset_completes() {
+        let (group, set, offers) = confirmed_offers();
+        let key = group.key_context();
+        let mut tree = SigningEventTree::new(key.clone(), SETTLING);
+        let r = eid(1);
+        let (out, _) = tree.ingest_wire(
+            meta(r, pk(), 100),
+            WireEvent::ContactRequest { set: set.clone() },
+        );
+        assert!(matches!(
+            out[..],
+            [TreeEvent::Contact(ContactEvent::Request { .. })]
+        ));
+        for (i, offer) in offers.iter().enumerate() {
+            let (out, timers) = tree.ingest_wire(
+                meta(eid(10 + i as u8), pk(), 200 + i as u64),
+                WireEvent::ContactOffer {
+                    request_id: r,
+                    offer: offer.clone(),
+                },
+            );
+            assert!(matches!(
+                out[..],
+                [TreeEvent::Contact(ContactEvent::Offer { .. })]
+            ));
+            assert_eq!(timers.len(), 1);
+        }
+        let Some(TreeEvent::Contact(ContactEvent::RoundConfirmed {
+            subset,
+            session_id,
+            sign_task,
+            ..
+        })) = tree.timer_expired(r)
+        else {
+            panic!("expected a contact round to confirm");
+        };
+        assert_eq!(
+            subset
+                .iter()
+                .map(|entry| entry.event_id)
+                .collect::<Vec<_>>(),
+            [eid(10), eid(11)]
+        );
+        assert_eq!(
+            sign_task,
+            sp_contact_sign_task(&key, set, &offers[..2]).unwrap()
+        );
+
+        let (out, _) = tree.ingest_wire(
+            meta(eid(20), pk(), 300),
+            WireEvent::Partial {
+                request_id: r,
+                offer_subset: vec![eid(10), eid(11)],
+                signature_shares: ParticipantSignatureShares {
+                    share_index: offers[0].participant_binonces.share_index,
+                    signature_shares: vec![],
+                },
+            },
+        );
+        let [TreeEvent::Contact(ContactEvent::Partial {
+            session_id: partial_session,
+            ..
+        })] = &out[..]
+        else {
+            panic!("expected a contact partial, got {out:?}");
+        };
+        assert_eq!(*partial_session, session_id);
+    }
+
+    /// An offer whose proof does not check is refused on arrival and does not take its share
+    /// index, so the same device's honest offer still counts.
+    #[test]
+    fn a_tampered_contact_offer_is_refused_on_arrival() {
+        let (group, set, offers) = confirmed_offers();
+        let mut tree = SigningEventTree::new(group.key_context(), SETTLING);
+        let r = eid(1);
+        tree.ingest_wire(meta(r, pk(), 100), WireEvent::ContactRequest { set });
+        let mut tampered = offers[0].clone();
+        tampered.shares[0].proof[5] ^= 1;
+        let (out, timers) = tree.ingest_wire(
+            meta(eid(10), pk(), 200),
+            WireEvent::ContactOffer {
+                request_id: r,
+                offer: tampered,
+            },
+        );
+        assert!(matches!(
+            out[..],
+            [TreeEvent::Contact(ContactEvent::Rejected { .. })]
+        ));
+        assert!(timers.is_empty());
+        let (out, _) = tree.ingest_wire(
+            meta(eid(11), pk(), 210),
+            WireEvent::ContactOffer {
+                request_id: r,
+                offer: offers[0].clone(),
+            },
+        );
+        assert!(matches!(
+            out[..],
+            [TreeEvent::Contact(ContactEvent::Offer { .. })]
+        ));
+    }
+
+    /// A plain signing offer can't answer a contact request, and a contact offer can't answer a
+    /// signing request.
+    #[test]
+    fn an_offer_of_the_wrong_kind_is_refused() {
+        let (group, set, offers) = confirmed_offers();
+        let mut tree = SigningEventTree::new(group.key_context(), SETTLING);
+        let contact = eid(1);
+        let sign = eid(2);
+        tree.ingest_wire(meta(contact, pk(), 100), WireEvent::ContactRequest { set });
+        tree.ingest_wire(
+            meta(sign, pk(), 100),
+            WireEvent::Request {
+                sign_task: WireSignTask::Test {
+                    message: "t".into(),
+                },
+                message: "r".into(),
+            },
+        );
+        let (out, _) = tree.ingest_wire(
+            meta(eid(10), pk(), 200),
+            WireEvent::Offer {
+                request_id: contact,
+                binonces: vec![offers[0].participant_binonces.clone()],
+            },
+        );
+        assert!(matches!(
+            out[..],
+            [TreeEvent::Contact(ContactEvent::Rejected { .. })]
+        ));
+        let (out, _) = tree.ingest_wire(
+            meta(eid(11), pk(), 200),
+            WireEvent::ContactOffer {
+                request_id: sign,
+                offer: offers[1].clone(),
+            },
+        );
+        assert!(matches!(
+            out[..],
+            [TreeEvent::Signing(SigningEvent::Rejected { .. })]
+        ));
     }
 }

@@ -12,7 +12,10 @@
 use crate::channel::ParticipantShares;
 use crate::{EventId, PublicKey};
 use frostsnap_core::{
-    coordinator::{ParticipantBinonces, ParticipantSignatureShares},
+    coordinator::{
+        remote_sp_contact::SpContactOffer, ParticipantBinonces, ParticipantSignatureShares,
+    },
+    silent_payments::{ContactChangeSet, EcdhShare},
     SignSessionId, WireSignTask,
 };
 use nostr_sdk::{Event, TagKind};
@@ -238,6 +241,80 @@ pub enum SigningEvent {
 }
 
 // ============================================================================
+// Contact events
+// ============================================================================
+
+/// One offer of a [`ContactEvent::RoundConfirmed`] subset.
+#[derive(Debug, Clone)]
+pub struct ContactOfferEntry {
+    pub event_id: EventId,
+    pub author: PublicKey,
+    pub timestamp: u64,
+    pub offer: SpContactOffer,
+}
+
+/// The contact change set ceremony, folded from the channel like signing rounds. A request names a
+/// change set, each member's device confirms it and the member offers its ECDH shares, and once the
+/// settling timer picks a subset of a threshold of offers, the members in it sign. These go to the
+/// sink given to [`crate::signing::ChannelClient::with_contact_sink`], not to the chat's sink.
+#[derive(Debug, Clone)]
+pub enum ContactEvent {
+    Request {
+        event_id: EventId,
+        author: PublicKey,
+        set: ContactChangeSet,
+        timestamp: u64,
+    },
+    /// An offer whose shares checked against the wallet's key. One that does not check is
+    /// `Rejected` instead and never takes a place in the subset.
+    Offer {
+        event_id: EventId,
+        author: PublicKey,
+        request_id: EventId,
+        offer: SpContactOffer,
+        timestamp: u64,
+    },
+    /// The subset is locked in. `sign_task` is the change set with each add's `x * B_scan`
+    /// combined from the subset's shares, and `session_id` the session its signatures belong to.
+    RoundConfirmed {
+        request_id: EventId,
+        subset: Vec<ContactOfferEntry>,
+        session_id: SignSessionId,
+        sign_task: WireSignTask,
+        timestamp: u64,
+    },
+    RoundPending {
+        request_id: EventId,
+        observed: Vec<EventId>,
+        threshold: usize,
+        timestamp: u64,
+    },
+    /// A signature share over the task the partial's `offer_subset` completes.
+    Partial {
+        event_id: EventId,
+        author: PublicKey,
+        request_id: EventId,
+        offer_subset: Vec<EventId>,
+        session_id: SignSessionId,
+        sign_task: WireSignTask,
+        signature_shares: ParticipantSignatureShares,
+        timestamp: u64,
+    },
+    Cancel {
+        event_id: EventId,
+        author: PublicKey,
+        request_id: EventId,
+        timestamp: u64,
+    },
+    Rejected {
+        event_id: EventId,
+        author: PublicKey,
+        timestamp: u64,
+        reason: String,
+    },
+}
+
+// ============================================================================
 // Wire format
 // ============================================================================
 
@@ -286,6 +363,20 @@ pub(crate) enum SigningMessage {
         signature_shares: ParticipantSignatureShares,
     },
     Cancel,
+    /// Index 4 was the silent payment offer of the per-send ECDH round (PR 640), which this
+    /// branch dropped. It stays reserved so a channel that carries one never decodes it as
+    /// something else.
+    RetiredSpOffer,
+    /// Asks the group to confirm a contact change set. Partials and Cancel are shared with signing.
+    ContactRequest {
+        set: ContactChangeSet,
+    },
+    /// A member's device confirmed the change set: binonces for one signature per change, and the
+    /// device's ECDH share of each add with its proof.
+    ContactOffer {
+        binonces: ParticipantBinonces,
+        shares: Vec<EcdhShare>,
+    },
 }
 
 /// Wire format for receive-address share messages (kind 7800).
@@ -298,4 +389,57 @@ pub(crate) enum SigningMessage {
 pub struct ReceiveAddressPayload {
     pub derivation_index: u32,
     pub memo: String,
+}
+
+#[cfg(test)]
+mod encoding {
+    use super::SigningMessage;
+    use frostsnap_core::coordinator::ParticipantBinonces;
+    use frostsnap_core::schnorr_fun::fun::{marker::*, Scalar};
+    use frostsnap_core::silent_payments::{BookHead, ContactChangeSet};
+
+    fn encoded(message: &SigningMessage) -> String {
+        let bytes = bincode::encode_to_vec(message, bincode::config::standard()).unwrap();
+        frostsnap_core::hex::encode(&bytes)
+    }
+
+    /// New variants are appended, so the bytes of the existing ones do not change, and index 4
+    /// stays reserved for the retired silent payment offer. `standard()` encodes the variant
+    /// index and lengths as varints.
+    #[test]
+    fn contact_messages_are_appended_variants() {
+        assert_eq!(encoded(&SigningMessage::Offer { binonces: vec![] }), "0100");
+        assert_eq!(encoded(&SigningMessage::Cancel), "03");
+        assert_eq!(encoded(&SigningMessage::RetiredSpOffer), "04");
+        // Bytes written before the new variants still decode as what they were.
+        let decode = |hex: &str| {
+            let bytes = frostsnap_core::hex::decode(hex).unwrap();
+            bincode::decode_from_slice::<SigningMessage, _>(&bytes, bincode::config::standard())
+                .unwrap()
+                .0
+        };
+        assert!(
+            matches!(decode("0100"), SigningMessage::Offer { binonces } if binonces.is_empty())
+        );
+        assert!(matches!(decode("03"), SigningMessage::Cancel));
+        let request = encoded(&SigningMessage::ContactRequest {
+            set: ContactChangeSet {
+                head: BookHead::empty(),
+                changes: vec![],
+            },
+        });
+        assert!(request.starts_with("0500"), "{request}");
+        let share_index =
+            Scalar::<Secret, NonZero>::from(core::num::NonZeroU32::new(1).unwrap()).public();
+        assert_eq!(
+            encoded(&SigningMessage::ContactOffer {
+                binonces: ParticipantBinonces {
+                    share_index,
+                    binonces: vec![],
+                },
+                shares: vec![],
+            })[..2],
+            *"06"
+        );
+    }
 }
