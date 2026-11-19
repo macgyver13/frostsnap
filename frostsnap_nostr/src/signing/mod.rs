@@ -429,6 +429,23 @@ impl ChannelHandle {
         self.send_signing_event(keys, &signing_msg, None).await
     }
 
+    /// Post a sign request that pays a contact, with `head`, the head of the requester's contact
+    /// book. Reviewers offer only from the same head.
+    pub async fn send_sign_request_at_head(
+        &self,
+        keys: &Keys,
+        sign_task: WireSignTask,
+        message: String,
+        head: BookHead,
+    ) -> Result<EventId> {
+        let signing_msg = SigningMessage::RequestAtHead {
+            sign_task,
+            message,
+            head,
+        };
+        self.send_signing_event(keys, &signing_msg, None).await
+    }
+
     /// Pump a wallet-stream tx into the runner. Drives the
     /// tx-observation correlation fold. Local-only — no relay
     /// traffic. Idempotent: repeated notifies of the same tx
@@ -623,7 +640,20 @@ fn ingest_signing_message(
 ) -> Result<(Vec<TreeEvent>, Vec<TimerAction>), String> {
     let err = |reason: &str| reason.to_string();
     let wire = match message {
-        SigningMessage::Request { sign_task, message } => WireEvent::Request { sign_task, message },
+        SigningMessage::Request { sign_task, message } => WireEvent::Request {
+            sign_task,
+            message,
+            book_head: None,
+        },
+        SigningMessage::RequestAtHead {
+            sign_task,
+            message,
+            head,
+        } => WireEvent::Request {
+            sign_task,
+            message,
+            book_head: Some(head),
+        },
         SigningMessage::Offer { binonces } => {
             let request_id = reply_to.ok_or_else(|| err("signing offer missing e-tag"))?;
             WireEvent::Offer {

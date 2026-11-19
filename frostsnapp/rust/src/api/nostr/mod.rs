@@ -10,6 +10,7 @@ use anyhow::{anyhow, Result};
 use flutter_rust_bridge::frb;
 use frostsnap_coordinator::persist::Persisted;
 use frostsnap_core::device::KeyPurpose;
+pub use frostsnap_core::silent_payments::BookHead;
 use frostsnap_core::{
     coordinator::{KeyContext, ParticipantBinonces, ParticipantSignatureShares},
     message::EncodedSignature,
@@ -922,6 +923,20 @@ pub fn identity_pubkey(identity: &NostrIdentity) -> PublicKey {
         .expect("nsec must be valid — was validated at Nsec::parse time")
 }
 
+/// A contact book's head: its version and the hash chain of the change sets that led to it.
+#[frb(mirror(BookHead), non_opaque)]
+pub struct _BookHead {
+    pub version: u32,
+    pub hash: [u8; 32],
+}
+
+#[frb(external)]
+impl BookHead {
+    /// A short code two signers compare to see they have the same book.
+    #[frb(sync)]
+    pub fn check_code(&self) -> String {}
+}
+
 // ============================================================================
 // PublicKey - Value mirror (32 bytes, x-only)
 // ============================================================================
@@ -1112,6 +1127,7 @@ pub enum _SigningEvent {
         author: PublicKey,
         sign_task: WireSignTask,
         message: String,
+        book_head: Option<BookHead>,
         timestamp: u64,
     },
     Offer {

@@ -22,6 +22,7 @@
 use super::events::ContactEvent;
 use crate::{EventId, PublicKey};
 use frostsnap_core::{
+    bitcoin_transaction::SpkOwner,
     coordinator::{
         remote_signing::{self, RemoteSignSessionId},
         remote_sp_contact::SpContactOffer,
@@ -96,6 +97,67 @@ pub enum CeremonyStatus {
     BlockedByOpenRequest { request_id: EventId },
 }
 
+/// Whether a reviewer may offer on a sign request, as far as contacts go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignGate {
+    /// The request pays no contact, or every contact it pays is in this book at the request's
+    /// head.
+    Allowed,
+    /// The request pays a contact but carries no book head.
+    MissingHead,
+    /// The request's head is one this book has not reached. The reviewer has announced its head
+    /// and waits for the sets it is missing.
+    WaitingForSync,
+    /// The request's head is behind this book: the requester's book is stale and the requester
+    /// rebuilds the send after syncing.
+    RequesterBehind,
+    /// The heads match, but the request pays this contact, which is not in the book.
+    NotInBook { name: String },
+}
+
+/// The verdict on a sign request paying from `book`. The heads must match for any request that
+/// pays a contact, and each contact paid must be the book's own record, so every signer of a
+/// payment sees the same contacts. The rule is the same for one recipient and for many.
+pub fn sign_gate(
+    book: &ContactBook,
+    sign_task: &WireSignTask,
+    request_head: Option<BookHead>,
+) -> SignGate {
+    let WireSignTask::BitcoinTransaction(template) = sign_task else {
+        return SignGate::Allowed;
+    };
+    let paid = template
+        .outputs()
+        .iter()
+        .filter_map(|output| match output.owner() {
+            SpkOwner::SilentPayment(sp) => Some(&sp.contact),
+            SpkOwner::Local(_) | SpkOwner::Foreign(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if paid.is_empty() {
+        return SignGate::Allowed;
+    }
+    let Some(request_head) = request_head else {
+        return SignGate::MissingHead;
+    };
+    if request_head != book.head() {
+        return if book.has_passed(&request_head) {
+            SignGate::RequesterBehind
+        } else {
+            SignGate::WaitingForSync
+        };
+    }
+    match paid
+        .into_iter()
+        .find(|contact| !book.contacts().any(|ours| ours == *contact))
+    {
+        Some(contact) => SignGate::NotInBook {
+            name: contact.contact.details.name.clone(),
+        },
+        None => SignGate::Allowed,
+    }
+}
+
 pub struct Ceremony {
     pub request_id: EventId,
     pub author: PublicKey,
@@ -155,6 +217,8 @@ pub struct ContactSync {
     republish: BTreeMap<BookHead, BTreeSet<[u8; 32]>>,
     /// The digests of every change set seen in the channel.
     published: BTreeSet<[u8; 32]>,
+    /// Sign requests this member announced its head for while waiting to sync.
+    announced_for: BTreeSet<EventId>,
 }
 
 impl ContactSync {
@@ -170,6 +234,7 @@ impl ContactSync {
             heads: Default::default(),
             republish: Default::default(),
             published: Default::default(),
+            announced_for: Default::default(),
         }
     }
 
@@ -441,6 +506,29 @@ impl ContactSync {
         Some(ContactAction::ScheduleRepublish(head))
     }
 
+    /// The gate's verdict on the sign request `request_id`, which carries `book_head`. The first
+    /// time it waits for this book to sync, the member announces its head, which prompts the
+    /// members ahead of it to republish.
+    pub fn sign_gate(
+        &mut self,
+        coord: &FrostCoordinator,
+        request_id: EventId,
+        sign_task: &WireSignTask,
+        book_head: Option<BookHead>,
+    ) -> (SignGate, Vec<ContactAction>) {
+        let book = self.book(coord);
+        let gate = sign_gate(&book, sign_task, book_head);
+        let mut actions = vec![];
+        if gate == SignGate::WaitingForSync && self.announced_for.insert(request_id) {
+            actions.push(ContactAction::Publish(ContactPublish::Head(book.head())));
+        }
+        // A requester whose book is stale gets the sets it is missing, as a head behind does.
+        if gate == SignGate::RequesterBehind && self.history_synced {
+            actions.extend(book_head.and_then(|head| self.answer_head(coord, head)));
+        }
+        (gate, actions)
+    }
+
     /// Asks `device_id` to confirm the change set of `request_id`, or to confirm it again after it
     /// forgot its approval. Refused with `WrongHead` while the request is ahead of this book.
     pub fn confirm(
@@ -690,9 +778,13 @@ mod tests {
     use crate::channel_runner::EventMeta;
     use crate::signing::events::{SigningMessage, WireEventId};
     use crate::signing::ingest_signing_message;
-    use crate::signing::test_group::{details, Group};
+    use crate::signing::test_group::{details, Group, NETWORK};
     use crate::signing::tree::{SigningEventTree, TreeEvent};
+    use bitcoin::Amount;
+    use frostsnap_core::bitcoin_transaction::{LocalSpk, TransactionTemplate};
+    use frostsnap_core::silent_payments::SignedSpContact;
     use frostsnap_core::test::TEST_ENCRYPTION_KEY;
+    use frostsnap_core::tweak::BitcoinBip32Path;
     use nostr_sdk::Keys;
 
     const SETTLING: std::time::Duration = std::time::Duration::from_secs(4);
@@ -1356,6 +1448,111 @@ mod tests {
             CeremonyStatus::WaitingForConfirmations { .. }
         ));
         net.confirm(1, fourth).unwrap();
+    }
+
+    /// A send paying `contact` from coordinator `ci`'s wallet.
+    fn send_paying(net: &Net, ci: usize, contact: &SignedSpContact) -> WireSignTask {
+        let coord = &net.group.run.participants[ci].coordinator;
+        let master_appkey = coord.iter_keys().next().unwrap().complete_key.master_appkey;
+        let mut template = TransactionTemplate::new();
+        template.push_imaginary_owned_input(
+            LocalSpk {
+                master_appkey,
+                bip32_path: BitcoinBip32Path::external(0),
+            },
+            Amount::from_sat(100_000),
+        );
+        let address = contact.contact.details.recipient.address(NETWORK).unwrap();
+        template.push_silent_payment_output(Amount::from_sat(50_000), contact.clone(), address);
+        WireSignTask::BitcoinTransaction(template)
+    }
+
+    fn contact(net: &Net, ci: usize, name: &str) -> SignedSpContact {
+        net.group.run.participants[ci]
+            .coordinator
+            .sp_contacts(net.group.key_id())
+            .find(|contact| contact.contact.details.name == name)
+            .unwrap()
+            .clone()
+    }
+
+    /// A reviewer offers on a send to a contact only from the requester's head. A reviewer that
+    /// is behind waits and announces its head once; one that is ahead says the requester's book is
+    /// stale. A request with no head is refused, and so is one that pays a contact the book
+    /// removed, for one recipient as for many.
+    #[test]
+    fn the_sign_gate_needs_the_same_book() {
+        let mut net = Net::new(2);
+        let add_lou = net.request(0, vec![add("Lou", 0x81), add("Max", 0x83)]);
+        net.confirm(0, add_lou).unwrap();
+        net.confirm(1, add_lou).unwrap();
+        net.settle_round(add_lou);
+        let lou = contact(&net, 0, "Lou");
+        let max = contact(&net, 0, "Max");
+        let to_lou = send_paying(&net, 0, &lou);
+        let head = net.head(0);
+        let request_id = EventId([0xaa; 32]);
+
+        let gate = |net: &mut Net, ci: usize, task: &WireSignTask, head: Option<BookHead>| {
+            net.members[ci].sync.sign_gate(
+                &net.group.run.participants[ci].coordinator,
+                request_id,
+                task,
+                head,
+            )
+        };
+        assert_eq!(gate(&mut net, 1, &to_lou, Some(head)).0, SignGate::Allowed);
+        assert_eq!(gate(&mut net, 1, &to_lou, None).0, SignGate::MissingHead);
+        let plain = WireSignTask::Test {
+            message: "no contacts".into(),
+        };
+        assert_eq!(gate(&mut net, 1, &plain, None).0, SignGate::Allowed);
+
+        // A head ahead of the reviewer's book: it waits and announces its head, once.
+        let unknown = BookHead::empty().next(&[9; 32]);
+        let (verdict, actions) = gate(&mut net, 1, &to_lou, Some(unknown));
+        assert_eq!(verdict, SignGate::WaitingForSync);
+        assert!(matches!(
+            actions[..],
+            [ContactAction::Publish(ContactPublish::Head(h))] if h == head
+        ));
+        assert!(gate(&mut net, 1, &to_lou, Some(unknown)).1.is_empty());
+
+        // Remove Lou. A request from the old head is now behind the reviewer's book, and one
+        // from the new head that still pays Lou, alone or with Max, is refused.
+        let remove_lou = net.request(2, vec![ContactChange::Remove(details("Lou", 0x81, 0x82))]);
+        net.confirm(1, remove_lou).unwrap();
+        net.confirm(2, remove_lou).unwrap();
+        net.settle_round(remove_lou);
+        let new_head = net.head(1);
+        assert_ne!(new_head, head);
+        let (verdict, actions) = gate(&mut net, 1, &to_lou, Some(head));
+        assert_eq!(verdict, SignGate::RequesterBehind);
+        // The stale requester is sent the sets after its head, once.
+        assert!(matches!(
+            actions[..],
+            [ContactAction::ScheduleRepublish(h)] if h == head
+        ));
+        assert!(gate(&mut net, 1, &to_lou, Some(head)).1.is_empty());
+        assert_eq!(
+            gate(&mut net, 1, &to_lou, Some(new_head)).0,
+            SignGate::NotInBook { name: "Lou".into() }
+        );
+        let WireSignTask::BitcoinTransaction(mut to_both) = send_paying(&net, 0, &max) else {
+            unreachable!()
+        };
+        let address = lou.contact.details.recipient.address(NETWORK).unwrap();
+        to_both.push_silent_payment_output(Amount::from_sat(20_000), lou.clone(), address);
+        let to_both = WireSignTask::BitcoinTransaction(to_both);
+        assert_eq!(
+            gate(&mut net, 1, &to_both, Some(new_head)).0,
+            SignGate::NotInBook { name: "Lou".into() }
+        );
+        let to_max = send_paying(&net, 0, &max);
+        assert_eq!(
+            gate(&mut net, 1, &to_max, Some(new_head)).0,
+            SignGate::Allowed
+        );
     }
 
     /// A forged set from a member of the channel never reaches the book.

@@ -186,6 +186,9 @@ pub enum SigningEvent {
         author: PublicKey,
         sign_task: WireSignTask,
         message: String,
+        /// The requester's contact book head. A request that pays a contact carries it, and a
+        /// reviewer offers only from the same head (see `contacts::sign_gate`).
+        book_head: Option<BookHead>,
         timestamp: u64,
     },
     Offer {
@@ -403,6 +406,13 @@ pub(crate) enum SigningMessage {
     BookHead {
         head: BookHead,
     },
+    /// A sign request that pays a contact, with the head of the requester's book. `Request` keeps
+    /// its bytes, so a request that pays no contact is still a `Request`.
+    RequestAtHead {
+        sign_task: WireSignTask,
+        message: String,
+        head: BookHead,
+    },
 }
 
 /// Wire format for receive-address share messages (kind 7800).
@@ -487,5 +497,13 @@ mod encoding {
             encoded(&SigningMessage::BookHead { head }),
             format!("0800{}", frostsnap_core::hex::encode(&head.hash))
         );
+        let at_head = encoded(&SigningMessage::RequestAtHead {
+            sign_task: frostsnap_core::WireSignTask::Test {
+                message: String::new(),
+            },
+            message: String::new(),
+            head,
+        });
+        assert!(at_head.starts_with("09"), "{at_head}");
     }
 }

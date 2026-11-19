@@ -38,7 +38,7 @@ use frostsnap_core::{
     },
     message::GroupSignReq,
     schnorr_fun::frost::ShareIndex,
-    silent_payments::ContactChangeSet,
+    silent_payments::{BookHead, ContactChangeSet},
     WireSignTask,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -100,6 +100,7 @@ pub(crate) enum WireEvent {
     Request {
         sign_task: WireSignTask,
         message: String,
+        book_head: Option<BookHead>,
     },
     Offer {
         request_id: EventId,
@@ -190,13 +191,18 @@ impl SigningEventTree {
                 }
             };
             match wire {
-                WireEvent::Request { sign_task, message } => {
+                WireEvent::Request {
+                    sign_task,
+                    message,
+                    book_head,
+                } => {
                     self.insert_request(&meta, RequestKind::Sign(sign_task.clone()));
                     events.push(TreeEvent::Signing(SigningEvent::Request {
                         event_id: meta.event_id,
                         author: meta.author,
                         sign_task,
                         message,
+                        book_head,
                         timestamp: meta.timestamp,
                     }));
                     self.drain_pending_into(meta.event_id, &mut queue);
@@ -697,6 +703,7 @@ mod tests {
             WireEvent::Request {
                 sign_task: test_task(),
                 message: "r".into(),
+                book_head: None,
             },
         )
     }
@@ -1254,6 +1261,7 @@ mod contact_tests {
                     message: "t".into(),
                 },
                 message: "r".into(),
+                book_head: None,
             },
         );
         let (out, _) = tree.ingest_wire(
