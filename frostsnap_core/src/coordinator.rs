@@ -44,6 +44,7 @@ pub mod keys;
 pub mod remote_keygen;
 pub mod remote_recovery;
 pub mod remote_signing;
+pub mod remote_sp_contact;
 pub mod restoration;
 pub mod signing;
 pub use coordinator_to_user::*;
@@ -116,6 +117,8 @@ pub struct SpContactSession {
     pub requested: BTreeSet<DeviceId>,
     /// Each device's ECDH shares, one per add in the order of the adds.
     pub shares: BTreeMap<DeviceId, Vec<EcdhShare>>,
+    /// For a remote session, the binonces its offer reserved.
+    pub reserved_nonces: Option<SigningReqSubSegment>,
 }
 
 #[derive(Debug, Clone, bincode::Encode, bincode::Decode, PartialEq)]
@@ -1314,6 +1317,7 @@ impl FrostCoordinator {
                 changes,
                 requested: devices.clone(),
                 shares: Default::default(),
+                reserved_nonces: None,
             },
         );
 
@@ -1931,6 +1935,11 @@ impl FrostCoordinator {
                     .values()
                     .map(|device_nonces| device_nonces.stream_id)
             })
+            .chain(
+                self.sp_contact_sessions.values().filter_map(|session| {
+                    Some(session.reserved_nonces.as_ref()?.segment.stream_id)
+                }),
+            )
             .collect()
     }
 
@@ -2411,6 +2420,7 @@ pub enum StartSignError {
     ConflictingRemoteSignSession,
     NoSuchSpContactSession,
     SpContactChanges(ChangeSetError),
+    InvalidSpContactOffer(&'static str),
 }
 
 impl fmt::Display for StartSignError {
@@ -2432,6 +2442,9 @@ impl fmt::Display for StartSignError {
                 write!(f, "Those contact changes are no longer being confirmed")
             }
             StartSignError::SpContactChanges(error) => error.fmt(f),
+            StartSignError::InvalidSpContactOffer(reason) => {
+                write!(f, "A contact offer is not valid: {reason}")
+            }
             StartSignError::NotEnoughNoncesForDevice(not_enough_nonces) => not_enough_nonces.fmt(f),
             StartSignError::DeviceNotPartOfKey { device_id } => {
                 write!(
@@ -2716,7 +2729,7 @@ impl IntoIterator for SendFinalizeKeygen {
 
 /// Checks the ECDH shares one device gave for the adds of `changes`: one per add, in order, each
 /// from `share_index` and with a valid proof for that add's details.
-fn check_sp_contact_shares_of(
+pub(super) fn check_sp_contact_shares_of(
     app_shared_key: &Xpub<SharedKey>,
     changes: &ContactChangeSet,
     network: bitcoin::Network,
@@ -2742,7 +2755,7 @@ fn check_sp_contact_shares_of(
 
 /// Combines a threshold of devices' ECDH shares, each one per add of `changes` in order, into the
 /// change set the wallet signs and the proofs each signer checks it against.
-fn combine_sp_contact_changes<'a>(
+pub(super) fn combine_sp_contact_changes<'a>(
     app_shared_key: &Xpub<SharedKey>,
     changes: ContactChangeSet,
     network: bitcoin::Network,

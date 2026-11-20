@@ -569,7 +569,7 @@ impl FrostCoordinator {
                     coord_share_decryption_contrib,
                 },
             },
-            // A remote session never signs a contact.
+            // A contact change set's proofs are added by `sign_remote_sp_contact`.
             sp_contact_proofs: None,
         })
     }
