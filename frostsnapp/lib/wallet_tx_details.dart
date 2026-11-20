@@ -16,9 +16,11 @@ import 'package:frostsnap/snackbar.dart';
 import 'package:frostsnap/src/rust/api.dart';
 import 'package:frostsnap/src/rust/api/bitcoin.dart';
 import 'package:frostsnap/src/rust/api/device_list.dart';
+import 'package:frostsnap/src/rust/api/nostr.dart';
 import 'package:frostsnap/src/rust/api/psbt_manager.dart';
 import 'package:frostsnap/src/rust/api/signing.dart';
 import 'package:frostsnap/src/rust/api/super_wallet.dart';
+import 'package:frostsnap/src/rust/lib.dart' show WireSignTask;
 import 'package:frostsnap/theme.dart';
 import 'package:frostsnap/wallet.dart';
 import 'package:glowy_borders/glowy_borders.dart';
@@ -962,6 +964,7 @@ Widget buildDetailsColumn(
   bool dense = true,
   bool showConfirmations = true,
   SigningState? signingState,
+  WireSignTask? signTask,
 }) {
   const contentPadding = EdgeInsets.symmetric(horizontal: 16);
   final walletCtx = WalletContext.of(context)!;
@@ -969,32 +972,32 @@ Widget buildDetailsColumn(
   final fee = txDetails.tx.fee();
   return Column(
     children: [
-      if (txDetails.isSend)
-        ...txDetails.tx.recipients().where((info) => !info.isMine).map((info) {
-          final address = info.address(network: walletCtx.network)?.toString();
-          return Column(
-            children: [
-              CopyListTile(
-                data: address,
-                dense: dense,
-                contentPadding: contentPadding,
-                leading: Text('Recipient #${info.vout}'),
-                title: Text(
-                  spacedHex(address ?? '<unknown>'),
-                  style: monospaceTextStyle,
-                  textAlign: TextAlign.end,
-                ),
-              ),
-              CopyListTile(
-                data: '${info.amount}',
-                dense: dense,
-                contentPadding: contentPadding,
-                leading: Text('\u2570 Amount'),
-                title: SatoshiText(value: info.amount, showSign: false),
-              ),
-            ],
-          );
-        }),
+      if (txDetails.isSend) ...[
+        _CollapsibleTxRecipients(
+          recipients: () {
+            // The sign task lists a contact by its silent payment address.
+            if (signTask != null) {
+              return sendRecipients(
+                signTask: signTask,
+                network: walletCtx.network,
+              ).map((r) => (r.address, r.amountSat)).toList();
+            }
+            return txDetails.tx
+                .recipients()
+                .where((info) => !info.isMine)
+                .map(
+                  (info) => (
+                    info.address(network: walletCtx.network)?.toString() ??
+                        '<unknown>',
+                    info.amount,
+                  ),
+                )
+                .toList();
+          }(),
+          dense: dense,
+          contentPadding: contentPadding,
+        ),
+      ],
       if (!txDetails.isSend)
         // Filter to external owned outputs only (derivationIndex
         // is populated for external receive scripts only — change
@@ -1083,6 +1086,109 @@ Widget buildDetailsColumn(
       ),
     ],
   );
+}
+
+class _CollapsibleTxRecipients extends StatefulWidget {
+  final List<(String address, int amount)> recipients;
+  final bool dense;
+  final EdgeInsets contentPadding;
+
+  const _CollapsibleTxRecipients({
+    required this.recipients,
+    required this.dense,
+    required this.contentPadding,
+  });
+
+  @override
+  State<_CollapsibleTxRecipients> createState() =>
+      _CollapsibleTxRecipientsState();
+}
+
+class _CollapsibleTxRecipientsState extends State<_CollapsibleTxRecipients> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final count = widget.recipients.length;
+    final totalSats = widget.recipients.fold<int>(0, (sum, r) => sum + r.$2);
+
+    if (count <= 3) {
+      return Column(
+        children: [
+          for (int i = 0; i < widget.recipients.length; i++) ...[
+            CopyListTile(
+              data: widget.recipients[i].$1,
+              dense: widget.dense,
+              contentPadding: widget.contentPadding,
+              leading: Text('Recipient #${i + 1}'),
+              title: Text(
+                spacedHex(widget.recipients[i].$1),
+                style: monospaceTextStyle,
+                textAlign: TextAlign.end,
+              ),
+            ),
+            CopyListTile(
+              data: '${widget.recipients[i].$2}',
+              dense: widget.dense,
+              contentPadding: widget.contentPadding,
+              leading: const Text('\u2570 Amount'),
+              title: SatoshiText(
+                value: widget.recipients[i].$2,
+                showSign: false,
+              ),
+            ),
+          ],
+        ],
+      );
+    }
+
+    return Column(
+      children: [
+        InkWell(
+          onTap: () => setState(() => _expanded = !_expanded),
+          child: Padding(
+            padding: widget.contentPadding.copyWith(top: 10, bottom: 10),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Row(
+                  children: [
+                    Text('$count recipients, total '),
+                    SatoshiText(value: totalSats, showSign: false),
+                  ],
+                ),
+                Icon(_expanded ? Icons.expand_less : Icons.expand_more),
+              ],
+            ),
+          ),
+        ),
+        if (_expanded)
+          for (int i = 0; i < widget.recipients.length; i++) ...[
+            CopyListTile(
+              data: widget.recipients[i].$1,
+              dense: widget.dense,
+              contentPadding: widget.contentPadding,
+              leading: Text('Recipient #${i + 1}'),
+              title: Text(
+                spacedHex(widget.recipients[i].$1),
+                style: monospaceTextStyle,
+                textAlign: TextAlign.end,
+              ),
+            ),
+            CopyListTile(
+              data: '${widget.recipients[i].$2}',
+              dense: widget.dense,
+              contentPadding: widget.contentPadding,
+              leading: const Text('\u2570 Amount'),
+              title: SatoshiText(
+                value: widget.recipients[i].$2,
+                showSign: false,
+              ),
+            ),
+          ],
+      ],
+    );
+  }
 }
 
 Future<void> rebroadcastAction(

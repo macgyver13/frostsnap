@@ -3031,9 +3031,9 @@ class _OfferSignSheetState extends State<_OfferSignSheet> {
       );
     }
 
-    final details = signingDetails(signTask: widget.state.request.signTask);
+    final signTask = widget.state.request.signTask;
+    final details = signingDetails(signTask: signTask);
     final walletCtx = WalletContext.of(context);
-
     return SingleChildScrollView(
       controller: widget.scrollController,
       child: Column(
@@ -3049,6 +3049,7 @@ class _OfferSignSheetState extends State<_OfferSignSheet> {
                 now: DateTime.now(),
               ),
               showConfirmations: false,
+              signTask: signTask,
             ),
             const Divider(),
           ] else if (details is SigningDetails_Message) ...[

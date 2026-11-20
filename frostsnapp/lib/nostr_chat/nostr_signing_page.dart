@@ -580,6 +580,7 @@ class _NostrSigningPageState extends State<NostrSigningPage> {
                     txDetails: widget.txDetails,
                     dense: true,
                     showConfirmations: false,
+                    signTask: widget.signingState.request.signTask,
                   ),
                 ),
               ),

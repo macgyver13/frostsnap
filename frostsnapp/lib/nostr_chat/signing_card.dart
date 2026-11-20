@@ -8,6 +8,7 @@ import 'package:frostsnap/src/rust/api/signing.dart';
 import 'package:frostsnap/theme.dart';
 import 'package:frostsnap/wallet.dart';
 import 'package:frostsnap/wallet_tx_details.dart';
+import 'package:frostsnap/src/rust/lib.dart' show WireSignTask;
 
 class SigningRequestState extends ChangeNotifier {
   final SigningEvent_Request request;
@@ -91,6 +92,7 @@ Widget _buildSigningDetails(
   ThemeData theme,
   SigningDetails details, {
   VoidCallback? onTap,
+  WireSignTask? signTask,
 }) {
   if (details is SigningDetails_Transaction) {
     final walletCtx = WalletContext.of(context);
@@ -105,44 +107,80 @@ Widget _buildSigningDetails(
       final accentColor = txDetails.isSend
           ? Colors.redAccent.harmonizeWith(theme.colorScheme.primary)
           : Colors.green.harmonizeWith(theme.colorScheme.primary);
+      // The sign task lists a contact by its silent payment address.
+      final recips = !txDetails.isSend
+          ? const <(String, int)>[]
+          : signTask != null
+          ? [
+              for (final r in sendRecipients(
+                signTask: signTask,
+                network: walletCtx.network,
+              ))
+                (r.address, r.amountSat),
+            ]
+          : tx
+                .recipients()
+                .where((r) => !r.isMine)
+                .map(
+                  (r) => (
+                    r.address(network: walletCtx.network)?.toString() ??
+                        '<unknown>',
+                    r.amount,
+                  ),
+                )
+                .toList();
+
       return Container(
         decoration: BoxDecoration(
           color: theme.colorScheme.surface.withValues(alpha: 0.5),
           borderRadius: BorderRadius.circular(8),
         ),
-        child: ListTile(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-          contentPadding: const EdgeInsets.symmetric(horizontal: 16),
-          leading: Icon(
-            txDetails.isSend ? Icons.north_east : Icons.south_east,
-            color: accentColor,
-          ),
-          title: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(txDetails.isSend ? 'Send' : 'Receive'),
-              SatoshiText(
-                value: txDetails.netValue.abs(),
-                style: theme.textTheme.bodyLarge,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            ListTile(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
               ),
-            ],
-          ),
-          onTap:
-              onTap ??
-              () {
-                showBottomSheetOrDialog(
-                  context,
-                  title: const Text('Transaction Details'),
-                  builder: (_, scrollController) => walletCtx.wrap(
-                    Builder(
-                      builder: (ctx) => SingleChildScrollView(
-                        controller: scrollController,
-                        child: buildDetailsColumn(ctx, txDetails: txDetails),
-                      ),
-                    ),
+              contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+              leading: Icon(
+                txDetails.isSend ? Icons.north_east : Icons.south_east,
+                color: accentColor,
+              ),
+              title: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(txDetails.isSend ? 'Send' : 'Receive'),
+                  SatoshiText(
+                    value: txDetails.netValue.abs(),
+                    style: theme.textTheme.bodyLarge,
                   ),
-                );
-              },
+                ],
+              ),
+              onTap:
+                  onTap ??
+                  () {
+                    showBottomSheetOrDialog(
+                      context,
+                      title: const Text('Transaction Details'),
+                      builder: (_, scrollController) => walletCtx.wrap(
+                        Builder(
+                          builder: (ctx) => SingleChildScrollView(
+                            controller: scrollController,
+                            child: buildDetailsColumn(
+                              ctx,
+                              txDetails: txDetails,
+                              signTask: signTask,
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+            ),
+            if (recips.isNotEmpty)
+              CollapsibleChatRecipients(recipients: recips),
+          ],
         ),
       );
     }
@@ -172,6 +210,105 @@ Widget _buildSigningDetails(
       ],
     ),
   );
+}
+
+class CollapsibleChatRecipients extends StatefulWidget {
+  final List<(String, int)> recipients;
+
+  const CollapsibleChatRecipients({super.key, required this.recipients});
+
+  @override
+  State<CollapsibleChatRecipients> createState() =>
+      _CollapsibleChatRecipientsState();
+}
+
+class _CollapsibleChatRecipientsState extends State<CollapsibleChatRecipients> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final count = widget.recipients.length;
+    final totalSats = widget.recipients.fold<int>(0, (sum, r) => sum + r.$2);
+
+    if (count <= 3) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (final (addr, sats) in widget.recipients)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('$sats sats', style: theme.textTheme.labelMedium),
+                  SelectableText(
+                    spacedHex(addr, groupSize: 4),
+                    style: monospaceTextStyle.copyWith(fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        InkWell(
+          onTap: () => setState(() => _expanded = !_expanded),
+          borderRadius: BorderRadius.circular(8),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Expanded(
+                  child: Row(
+                    children: [
+                      Text(
+                        '$count recipients, total ',
+                        style: theme.textTheme.labelMedium?.copyWith(
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      SatoshiText(
+                        value: totalSats,
+                        style: theme.textTheme.labelMedium?.copyWith(
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Icon(
+                  _expanded ? Icons.expand_less : Icons.expand_more,
+                  size: 20,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (_expanded)
+          for (final (addr, sats) in widget.recipients)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('$sats sats', style: theme.textTheme.labelMedium),
+                  SelectableText(
+                    spacedHex(addr, groupSize: 4),
+                    style: monospaceTextStyle.copyWith(fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+      ],
+    );
+  }
 }
 
 /// Common header row for all signing cards.
@@ -528,6 +665,7 @@ class SigningRequestCard extends StatelessWidget {
                   theme,
                   signingDetails(signTask: request.signTask),
                   onTap: onTap,
+                  signTask: request.signTask,
                 ),
                 if (request.message.isNotEmpty) ...[
                   const SizedBox(height: 6),
