@@ -4,13 +4,14 @@ use std::sync::{Arc, RwLock};
 
 use bitcoin::Address;
 use flutter_rust_bridge::frb;
+use frostsnap_coordinator::bitcoin::recipients_file;
 use frostsnap_coordinator::bitcoin::wallet::SendRecipient;
 use frostsnap_core::silent_payments::SilentPaymentRecipient;
 
 use super::signing::SpContactEntry;
 use frostsnap_core::{AccessStructureId, DeviceId, MasterAppkey};
 
-use crate::api::bitcoin::BitcoinNetworkExt;
+use crate::api::bitcoin::{BitcoinNetwork, BitcoinNetworkExt};
 use crate::api::broadcast::Broadcast;
 use crate::api::signing::UnsignedTx;
 use crate::frb_generated::RustAutoOpaque;
@@ -133,6 +134,19 @@ fn send_recipient(recipient: &Recipient) -> Option<SendRecipient> {
         }),
         None => Some(SendRecipient::Address(recipient.address.clone()?)),
     }
+}
+
+#[derive(Clone, Debug)]
+#[frb(type_64bit_int)]
+pub struct RecipientLine {
+    /// The 1-based line of the file the recipient was read from.
+    pub line: u32,
+    pub label: Option<String>,
+    pub address: String,
+    pub amount_sat: u64,
+    pub is_silent_payment: bool,
+    /// The contact a silent payment line pays.
+    pub contact: Option<SpContactEntry>,
 }
 
 pub(crate) struct BuildTxInner {
@@ -535,6 +549,31 @@ impl BuildTxState {
     }
 
     #[frb(sync)]
+    pub fn set_recipients(&self, lines: Vec<RecipientLine>) -> Result<(), String> {
+        {
+            let mut inner = self.inner.write().unwrap();
+            inner.recipients.clear();
+        }
+        for (i, line) in lines.into_iter().enumerate() {
+            let idx = i as u32;
+            match &line.contact {
+                Some(contact) => self.set_recipient_contact(idx, contact),
+                None => self.set_recipient_with_uri(idx, &line.address)?,
+            }
+            self.set_amount(idx, line.amount_sat);
+        }
+        self._trigger_changed();
+        Ok(())
+    }
+
+    #[frb(sync)]
+    pub fn clear_recipients(&self) {
+        let mut inner = self.inner.write().unwrap();
+        inner.recipients.clear();
+        self._trigger_changed();
+    }
+
+    #[frb(sync)]
     pub fn clear_amount(&self, recipient: u32) {
         let mut inner = self.inner.write().unwrap();
         if let Some(r) = inner.recipients.get_mut(recipient as usize) {
@@ -656,4 +695,34 @@ pub enum TryFinishTxError {
     MissingFeerate,
     IncompleteRecipientValues,
     InsufficientBalance,
+}
+
+/// Parses and checks a recipients file of `address,amount_sat[,label]` lines, matching its silent
+/// payment lines to `contacts`.
+#[frb(sync)]
+pub fn parse_recipients_file(
+    contents: String,
+    network: BitcoinNetwork,
+    contacts: Vec<SpContactEntry>,
+) -> Result<Vec<RecipientLine>, String> {
+    let entries = recipients_file::parse_csv(&contents)?;
+    recipients_file::validate(&entries, network)?;
+    let signed = contacts
+        .iter()
+        .map(|entry| entry.contact.clone())
+        .collect::<Vec<_>>();
+    let matched = recipients_file::match_contacts(&entries, network, &signed)?;
+    Ok(entries
+        .into_iter()
+        .zip(matched)
+        .map(|(entry, contact)| RecipientLine {
+            line: entry.line as u32,
+            is_silent_payment: SilentPaymentRecipient::from_address(&entry.address, network)
+                .is_some(),
+            label: entry.label,
+            address: entry.address,
+            amount_sat: entry.amount_sat,
+            contact: contact.map(|i| contacts[i].clone()),
+        })
+        .collect())
 }

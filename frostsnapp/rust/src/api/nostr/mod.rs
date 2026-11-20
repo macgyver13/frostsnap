@@ -2,6 +2,7 @@ pub mod keygen_run;
 pub mod remote_keygen;
 pub mod remote_recovery;
 
+use crate::api::bitcoin::BitcoinNetwork;
 use crate::api::broadcast::{BehaviorBroadcast, Broadcast};
 use crate::frb_generated::{RustAutoOpaque, StreamSink};
 use crate::nostr_settings_state::NostrSettingsState;
@@ -1236,6 +1237,49 @@ pub fn offer_share_indices(binonces: Vec<RustAutoOpaque<ParticipantBinonces>>) -
     binonces
         .iter()
         .map(|b| u32::try_from(b.blocking_read().share_index).expect("share index fits in u32"))
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+pub struct SendRecipientView {
+    pub address: String,
+    pub amount_sat: u64,
+    pub is_silent_payment: bool,
+}
+
+/// Every recipient of a send except change, in output order.
+#[frb(sync)]
+pub fn send_recipients(
+    sign_task: &WireSignTask,
+    network: BitcoinNetwork,
+) -> Vec<SendRecipientView> {
+    let WireSignTask::BitcoinTransaction(template) = sign_task else {
+        return vec![];
+    };
+    template
+        .outputs()
+        .iter()
+        .filter_map(|output| match output.owner() {
+            frostsnap_core::bitcoin_transaction::SpkOwner::SilentPayment(sp) => {
+                Some(SendRecipientView {
+                    address: sp.address.clone(),
+                    amount_sat: output.value,
+                    is_silent_payment: true,
+                })
+            }
+            frostsnap_core::bitcoin_transaction::SpkOwner::Local(_) => None,
+            frostsnap_core::bitcoin_transaction::SpkOwner::Foreign(spk) => {
+                let address = match bitcoin::Address::from_script(spk, network) {
+                    Ok(address) => address.to_string(),
+                    Err(_) => format!("{spk:x}"),
+                };
+                Some(SendRecipientView {
+                    address,
+                    amount_sat: output.value,
+                    is_silent_payment: false,
+                })
+            }
+        })
         .collect()
 }
 
