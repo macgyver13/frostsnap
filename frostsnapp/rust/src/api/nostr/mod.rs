@@ -1,3 +1,4 @@
+pub mod contacts;
 pub mod keygen_run;
 pub mod remote_keygen;
 pub mod remote_recovery;
@@ -109,10 +110,30 @@ broadcast_handle! { pub struct ChannelEventBcast(pub Broadcast<ChannelEvent>); }
 #[derive(Clone)]
 struct BroadcastSink {
     bcast: Broadcast<ChannelEvent>,
+    /// Every sign request seen, with the book head it carries, for the contact gate on offers.
+    requests: SignRequests,
 }
+
+type SignRequests = Arc<Mutex<HashMap<EventId, (WireSignTask, Option<BookHead>)>>>;
 
 impl frostsnap_coordinator::Sink<ChannelEvent> for BroadcastSink {
     fn send(&self, event: ChannelEvent) {
+        if let ChannelEvent::Signing {
+            event:
+                SigningEvent::Request {
+                    event_id,
+                    sign_task,
+                    book_head,
+                    ..
+                },
+            ..
+        } = &event
+        {
+            self.requests
+                .lock()
+                .unwrap()
+                .insert(*event_id, (sign_task.clone(), *book_head));
+        }
         self.bcast.add(&event);
     }
 }
@@ -395,6 +416,11 @@ pub struct ChannelHandle {
     pending: tokio::sync::Mutex<Option<ChannelClient>>,
     /// Set once `start()` finishes its inner `ChannelClient::run`.
     inner: tokio::sync::OnceCell<InnerChannelHandle>,
+    /// Set by `attach_contacts` before `start()`.
+    contacts_coord: OnceLock<crate::coordinator::FfiCoordinator>,
+    /// Set by `start()` when contacts are attached.
+    contacts: OnceLock<Arc<crate::contacts_glue::ContactsGlue>>,
+    requests: SignRequests,
 }
 
 impl ChannelHandle {
@@ -422,12 +448,28 @@ impl ChannelHandle {
         if self.inner.initialized() {
             return Ok(());
         }
-        let cc = pending
+        let mut cc = pending
             .take()
             .ok_or_else(|| anyhow!("channel handle has no pending client"))?;
         let sink = BroadcastSink {
             bcast: self.bcast.clone(),
+            requests: self.requests.clone(),
         };
+        let mut contacts = None;
+        let has_contacts = self.key_context.purpose.bitcoin_network().is_some();
+        if let Some(coord) = self.contacts_coord.get().filter(|_| has_contacts) {
+            let me = self.identity.public_key()?;
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let glue = Arc::new(crate::contacts_glue::ContactsGlue::new(
+                self.key_context.clone(),
+                me,
+                now_secs(),
+                coord.clone(),
+                tx.clone(),
+            )?);
+            cc = cc.with_contact_sink(crate::contacts_glue::ContactEventSink(tx));
+            contacts = Some((glue, rx));
+        }
         let inner = cc
             .run(self.nostr_client.clone(), sink, self.identity.clone())
             .await
@@ -435,6 +477,11 @@ impl ChannelHandle {
                 tracing::error!(error = %e, "failed to start channel runner");
                 e
             })?;
+        if let Some((glue, rx)) = contacts {
+            let keys = inner.runner_handle.signing_keys().clone();
+            tokio::spawn(glue.clone().run(rx, inner.clone(), keys));
+            let _ = self.contacts.set(glue);
+        }
         // Publish-after-fold is handled inside ChannelRunner::run via
         // the identity's publish policy; no explicit call here.
         let _ = self.inner.set(inner);
@@ -473,7 +520,8 @@ impl ChannelHandle {
             .await
     }
 
-    /// Propose a transaction for signing.
+    /// Propose a transaction for signing. A send that pays a contact carries this member's book
+    /// head, so contacts must be attached.
     pub async fn send_sign_request(
         &self,
         unsigned_tx: &super::signing::UnsignedTx,
@@ -481,8 +529,21 @@ impl ChannelHandle {
     ) -> Result<EventId> {
         let inner = self.require_inner()?;
         let keys = inner.runner_handle.signing_keys().clone();
+        let pays_contact = unsigned_tx.template_tx.outputs().iter().any(|output| {
+            matches!(
+                output.owner(),
+                frostsnap_core::bitcoin_transaction::SpkOwner::SilentPayment(_)
+            )
+        });
         let sign_task = WireSignTask::BitcoinTransaction(unsigned_tx.template_tx.clone());
-        inner.send_sign_request(&keys, sign_task, message).await
+        if pays_contact {
+            let head = self.book_head()?;
+            inner
+                .send_sign_request_at_head(&keys, sign_task, message, head)
+                .await
+        } else {
+            inner.send_sign_request(&keys, sign_task, message).await
+        }
     }
 
     /// Propose a test message for signing.
@@ -499,11 +560,17 @@ impl ChannelHandle {
         inner.send_sign_request(&keys, sign_task, message).await
     }
 
+    /// Offer to sign `request_id`. Refused unless the contact gate allows it: a send that pays a
+    /// contact needs this member's book at the request's head, with every contact paid in it.
     pub async fn send_sign_offer(
         &self,
         request_id: EventId,
         binonces: Vec<ParticipantBinonces>,
     ) -> Result<EventId> {
+        let gate = self.check_sign_gate(request_id).await?;
+        if gate != contacts::SignGate::Allowed {
+            return Err(anyhow!("can't offer on this request yet: {gate:?}"));
+        }
         let inner = self.require_inner()?;
         let keys = inner.runner_handle.signing_keys().clone();
         inner.send_sign_offer(&keys, request_id, binonces).await
@@ -675,6 +742,9 @@ impl NostrClient {
             identity,
             pending: tokio::sync::Mutex::new(Some(channel_client)),
             inner: tokio::sync::OnceCell::new(),
+            contacts_coord: OnceLock::new(),
+            contacts: OnceLock::new(),
+            requests: Default::default(),
         })
     }
 

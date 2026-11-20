@@ -1,4 +1,5 @@
 pub mod api;
+mod contacts_glue;
 mod coordinator;
 mod device_list;
 #[allow(clippy::all)]

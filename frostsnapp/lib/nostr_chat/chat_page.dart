@@ -461,6 +461,9 @@ class _ChatPageBodyState extends State<ChatPageBody> {
       identity: identity,
       params: widget.channelParams,
     );
+    // The wallet's shared contact book runs on this channel; it has to be
+    // attached before start().
+    _handle!.attachContacts(coord: coord);
     final stream = _handle!.events().watch();
     _subscription = stream.listen(_handleEvent);
     // listen-then-start: attaches the broadcast sink before the runner

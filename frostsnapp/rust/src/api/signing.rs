@@ -954,6 +954,8 @@ impl Coordinator {
         self.0.sp_contacts(key_id)
     }
 
+    /// Hides a contact on this app only, for a wallet with no nostr channel. A nostr wallet
+    /// removes a contact with `ChannelHandle::start_contact_changes`, so every member agrees.
     pub fn remove_sp_contact(&self, key_id: KeyId, name: String) -> Result<()> {
         self.0.remove_sp_contact(key_id, name)
     }
