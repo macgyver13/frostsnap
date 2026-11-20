@@ -207,6 +207,9 @@ pub enum ChannelRunnerEvent {
     /// Channel-infrastructure pass-through — see [`ChannelInfraEvent`].
     Channel(ChannelInfraEvent),
     CreationEventReceived,
+    /// The background sync with the relays finished (or failed), and every event it found has
+    /// been emitted. Events emitted before this one are the channel's history.
+    HistorySynced,
 }
 
 // =============================================================================
@@ -649,6 +652,7 @@ impl ChannelRunner {
                             }
                             Err(e) => tracing::warn!(error = %e, "failed to query after sync"),
                         }
+                        let _ = event_tx.send(ChannelRunnerEvent::HistorySynced);
                     }
                     notification = notifications.recv() => {
                         match notification {

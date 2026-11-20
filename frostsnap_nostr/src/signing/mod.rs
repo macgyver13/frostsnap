@@ -1,3 +1,4 @@
+pub mod contacts;
 mod events;
 #[cfg(test)]
 mod test_group;
@@ -25,7 +26,7 @@ use frostsnap_core::{
         remote_sp_contact::SpContactOffer, KeyContext, ParticipantBinonces,
         ParticipantSignatureShares,
     },
-    silent_payments::ContactChangeSet,
+    silent_payments::{BookHead, ContactChangeSet, SignedSpContactChanges},
     WireSignTask,
 };
 use nostr_sdk::{Client, Event, Keys, Kind};
@@ -275,6 +276,9 @@ impl ChannelClient {
                                 // state unperturbed on every change.
                                 sink.send(ChannelEvent::GroupMetadata { members });
                             }
+                            Some(ChannelRunnerEvent::HistorySynced) => {
+                                contact_sink.send(ContactEvent::HistorySynced);
+                            }
                             Some(ChannelRunnerEvent::CreationEventReceived) => {
                                 if let Some(creation_event) = runner_handle_for_task.creation_event() {
                                     match crate::channel_runner::decode_bincode::<crate::ChannelInitData>(&creation_event) {
@@ -498,6 +502,22 @@ impl ChannelHandle {
             .await
     }
 
+    /// Publish a signed contact change set. Every member checks it before applying it.
+    pub async fn send_contact_changes(
+        &self,
+        keys: &Keys,
+        signed: SignedSpContactChanges,
+    ) -> Result<EventId> {
+        let message = SigningMessage::ContactChanges { signed };
+        self.send_signing_event(keys, &message, None).await
+    }
+
+    /// Announce the head of this member's contact book.
+    pub async fn send_book_head(&self, keys: &Keys, head: BookHead) -> Result<EventId> {
+        let message = SigningMessage::BookHead { head };
+        self.send_signing_event(keys, &message, None).await
+    }
+
     pub async fn send_sign_cancel(&self, keys: &Keys, request_id: EventId) -> Result<EventId> {
         let message = SigningMessage::Cancel;
         self.send_signing_event(keys, &message, Some(request_id))
@@ -590,11 +610,22 @@ fn process_signing_inner_event(
         err(format!("failed to decode signing message: {e}"))
     })?;
 
+    ingest_signing_message(tree, meta.clone(), message, extract_e_tag(inner_event)).map_err(err)
+}
+
+/// Feed a decoded signing message to the tree. `reply_to` is the event's e-tag, which names the
+/// request of an offer, partial or cancel.
+fn ingest_signing_message(
+    tree: &mut SigningEventTree,
+    meta: EventMeta,
+    message: SigningMessage,
+    reply_to: Option<EventId>,
+) -> Result<(Vec<TreeEvent>, Vec<TimerAction>), String> {
+    let err = |reason: &str| reason.to_string();
     let wire = match message {
         SigningMessage::Request { sign_task, message } => WireEvent::Request { sign_task, message },
         SigningMessage::Offer { binonces } => {
-            let request_id = extract_e_tag(inner_event)
-                .ok_or_else(|| err("signing offer missing e-tag".into()))?;
+            let request_id = reply_to.ok_or_else(|| err("signing offer missing e-tag"))?;
             WireEvent::Offer {
                 request_id,
                 binonces,
@@ -604,8 +635,7 @@ fn process_signing_inner_event(
             offer_subset,
             signature_shares,
         } => {
-            let request_id = extract_e_tag(inner_event)
-                .ok_or_else(|| err("signing partial missing e-tag".into()))?;
+            let request_id = reply_to.ok_or_else(|| err("signing partial missing e-tag"))?;
             WireEvent::Partial {
                 request_id,
                 offer_subset: offer_subset.into_iter().map(EventId::from).collect(),
@@ -613,17 +643,34 @@ fn process_signing_inner_event(
             }
         }
         SigningMessage::Cancel => {
-            let request_id = extract_e_tag(inner_event)
-                .ok_or_else(|| err("signing cancel missing e-tag".into()))?;
+            let request_id = reply_to.ok_or_else(|| err("signing cancel missing e-tag"))?;
             WireEvent::Cancel { request_id }
         }
         SigningMessage::RetiredSpOffer => {
-            return Err(err("retired silent payment offer".into()));
+            return Err(err("retired silent payment offer"));
+        }
+        // A signed change set and a book head stand alone: they are not part of a round.
+        SigningMessage::ContactChanges { signed } => {
+            let event = ContactEvent::Changes {
+                event_id: meta.event_id,
+                author: meta.author,
+                signed,
+                timestamp: meta.timestamp,
+            };
+            return Ok((vec![TreeEvent::Contact(event)], vec![]));
+        }
+        SigningMessage::BookHead { head } => {
+            let event = ContactEvent::BookHead {
+                event_id: meta.event_id,
+                author: meta.author,
+                head,
+                timestamp: meta.timestamp,
+            };
+            return Ok((vec![TreeEvent::Contact(event)], vec![]));
         }
         SigningMessage::ContactRequest { set } => WireEvent::ContactRequest { set },
         SigningMessage::ContactOffer { binonces, shares } => {
-            let request_id = extract_e_tag(inner_event)
-                .ok_or_else(|| err("contact offer missing e-tag".into()))?;
+            let request_id = reply_to.ok_or_else(|| err("contact offer missing e-tag"))?;
             WireEvent::ContactOffer {
                 request_id,
                 offer: SpContactOffer {

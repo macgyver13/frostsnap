@@ -320,6 +320,7 @@ impl RecoveryLobbyClient {
 
             while let Some(event) = events.recv().await {
                 match event {
+                    ChannelRunnerEvent::HistorySynced => {}
                     ChannelRunnerEvent::CreationEventReceived => {
                         // Metadata decoded here → fold created →
                         // buffered events replayed → first StateChanged.

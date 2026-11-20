@@ -509,6 +509,7 @@ impl LobbyClient {
             let mut events_by_id: HashMap<EventId, Event> = HashMap::new();
             while let Some(event) = events.recv().await {
                 match event {
+                    ChannelRunnerEvent::HistorySynced => {}
                     ChannelRunnerEvent::CreationEventReceived => {
                         let creation = state_for_task.lock().unwrap().creation_event.clone();
                         if let Some(creation) = creation {

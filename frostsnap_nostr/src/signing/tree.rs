@@ -790,6 +790,7 @@ mod tests {
                 TreeEvent::Contact(ContactEvent::Rejected { event_id, .. }) => {
                     (*event_id, "ContactRejected")
                 }
+                TreeEvent::Contact(other) => panic!("the tree never emits {other:?}"),
                 TreeEvent::Signing(e) => match e {
                     SigningEvent::Request { event_id, .. } => (*event_id, "Request"),
                     SigningEvent::Offer { event_id, .. } => (*event_id, "Offer"),

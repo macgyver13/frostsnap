@@ -15,7 +15,7 @@ use frostsnap_core::{
     coordinator::{
         remote_sp_contact::SpContactOffer, ParticipantBinonces, ParticipantSignatureShares,
     },
-    silent_payments::{ContactChangeSet, EcdhShare},
+    silent_payments::{BookHead, ContactChangeSet, EcdhShare, SignedSpContactChanges},
     SignSessionId, WireSignTask,
 };
 use nostr_sdk::{Event, TagKind};
@@ -312,6 +312,23 @@ pub enum ContactEvent {
         timestamp: u64,
         reason: String,
     },
+    /// A signed change set any member published. Not checked yet: the receiver checks it against
+    /// the wallet's key before it touches the book.
+    Changes {
+        event_id: EventId,
+        author: PublicKey,
+        signed: SignedSpContactChanges,
+        timestamp: u64,
+    },
+    /// The head of a member's book, announced when it connects and with each offer it makes.
+    BookHead {
+        event_id: EventId,
+        author: PublicKey,
+        head: BookHead,
+        timestamp: u64,
+    },
+    /// The channel's history has been read from the relays. Events before this one are history.
+    HistorySynced,
 }
 
 // ============================================================================
@@ -377,6 +394,15 @@ pub(crate) enum SigningMessage {
         binonces: ParticipantBinonces,
         shares: Vec<EcdhShare>,
     },
+    /// A change set a threshold of devices signed. Published once by any member that has every
+    /// partial of the subset, and again by a member answering a head behind its own.
+    ContactChanges {
+        signed: SignedSpContactChanges,
+    },
+    /// The head of the author's contact book.
+    BookHead {
+        head: BookHead,
+    },
 }
 
 /// Wire format for receive-address share messages (kind 7800).
@@ -396,7 +422,9 @@ mod encoding {
     use super::SigningMessage;
     use frostsnap_core::coordinator::ParticipantBinonces;
     use frostsnap_core::schnorr_fun::fun::{marker::*, Scalar};
-    use frostsnap_core::silent_payments::{BookHead, ContactChangeSet};
+    use frostsnap_core::silent_payments::{
+        BookHead, ContactChangeSet, SignedSpContactChanges, SpContactChanges,
+    };
 
     fn encoded(message: &SigningMessage) -> String {
         let bytes = bincode::encode_to_vec(message, bincode::config::standard()).unwrap();
@@ -440,6 +468,24 @@ mod encoding {
                 shares: vec![],
             })[..2],
             *"06"
+        );
+        let head = BookHead::empty();
+        let changes = encoded(&SigningMessage::ContactChanges {
+            signed: SignedSpContactChanges {
+                changes: SpContactChanges {
+                    set: ContactChangeSet {
+                        head,
+                        changes: vec![],
+                    },
+                    account_ecdh: vec![],
+                },
+                signatures: vec![],
+            },
+        });
+        assert!(changes.starts_with("0700"), "{changes}");
+        assert_eq!(
+            encoded(&SigningMessage::BookHead { head }),
+            format!("0800{}", frostsnap_core::hex::encode(&head.hash))
         );
     }
 }
