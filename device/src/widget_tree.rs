@@ -107,12 +107,16 @@ impl WidgetTree {
     // temporaries from inflating FrostyUi::set_workflow's checked stack frame.
     #[inline(never)]
     pub(crate) fn build_sp_contact_prompt(phase: Box<SpContactEcdhPhase>, rand_seed: u32) -> Self {
+        let changes = phase
+            .changes()
+            .map(|(remove, name, address)| ContactChangeItem {
+                remove,
+                name: name.into(),
+                address: address.into(),
+            })
+            .collect();
         let widget = Box::new(SpContactPrompt::new(
-            alloc::vec![ContactChangeItem {
-                remove: false,
-                name: phase.name().into(),
-                address: phase.address().into(),
-            }],
+            changes,
             rand_seed,
             DEFAULT_LIST_REVIEW_THRESHOLD,
         ));

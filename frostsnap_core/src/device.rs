@@ -1,6 +1,6 @@
 use crate::device_nonces::{self, AbSlots, MemoryNonceSlot, NonceStreamSlot};
 use crate::nonce_stream::CoordNonceStreamState;
-use crate::silent_payments::{self, SpContact, SpContactDetails};
+use crate::silent_payments::{self, ContactChangeSet, SpContactChanges};
 use crate::symmetric_encryption::{Ciphertext, SymmetricKey};
 use crate::tweak::{self, BitcoinAccount, Xpub};
 use crate::{
@@ -27,7 +27,8 @@ mod device_to_user;
 pub mod restoration;
 pub use device_to_user::*;
 
-/// A request to add a contact, awaiting the user's confirmation of its name and address.
+/// A request to change the contact book, awaiting the user's confirmation of every change's name
+/// and address.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpContactEcdhPhase {
     session_id: signing::SpContactSessionId,
@@ -35,18 +36,26 @@ pub struct SpContactEcdhPhase {
     access_structure_ref: AccessStructureRef,
     coord_share_decryption_contrib: CoordShareDecryptionContrib,
     encrypted_secret_share: EncryptedSecretShare,
-    details: SpContactDetails,
+    changes: ContactChangeSet,
     network: bitcoin::Network,
-    address: String,
+    /// The address of each change, in order.
+    addresses: Vec<String>,
 }
 
 impl SpContactEcdhPhase {
-    pub fn name(&self) -> &str {
-        &self.details.name
-    }
-
-    pub fn address(&self) -> &str {
-        &self.address
+    /// Each change in order: whether it is a remove, the name and the address.
+    pub fn changes(&self) -> impl Iterator<Item = (bool, &str, &str)> {
+        self.changes
+            .changes
+            .iter()
+            .zip(&self.addresses)
+            .map(|(change, address)| {
+                (
+                    change.is_remove(),
+                    change.details().name.as_str(),
+                    address.as_str(),
+                )
+            })
     }
 }
 
@@ -65,9 +74,9 @@ pub struct FrostSigner<S = MemoryNonceSlot> {
     restoration: restoration::State,
     pub keygen_fingerprint: Fingerprint,
     pub nonce_batch_size: u32,
-    /// The contact the user last confirmed, by [`SpContactDetails::digest`]. In memory only: a
-    /// restart, a cancel or a newer confirmation forgets it. It is what lets the contact's
-    /// signature follow its ECDH without a second hold.
+    /// The contact change set the user last confirmed, by [`ContactChangeSet::digest`]. In memory
+    /// only: a restart, a cancel or a newer confirmation forgets it. It is what lets the set's
+    /// signatures follow its ECDH without a second hold.
     sp_contact_approval: Option<[u8; 32]>,
 }
 
@@ -364,7 +373,7 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
             access_structure_id,
             share_index,
             coord_share_decryption_contrib,
-            details,
+            changes,
         } = request;
         let key_id = KeyId::from_rootkey(rootkey);
         let key_data = self.keys.get(&key_id).ok_or_else(|| {
@@ -376,15 +385,20 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
                 "silent payment contact for a key that is not a bitcoin key",
             ));
         };
-        if !details.has_valid_name() {
+        if !changes.is_well_formed() {
             return Err(Error::signer_invalid_message(
                 message,
-                "silent payment contact has an invalid name",
+                "silent payment contact changes are not well formed",
             ));
         }
-        let address = details.recipient.address(network).ok_or_else(|| {
-            Error::signer_invalid_message(message, "silent payment contact has no address")
-        })?;
+        let addresses = changes
+            .changes
+            .iter()
+            .map(|change| change.details().recipient.address(network))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                Error::signer_invalid_message(message, "silent payment contact has no address")
+            })?;
         let access_structure_data = key_data
             .access_structures
             .get(&access_structure_id)
@@ -416,9 +430,9 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
             },
             coord_share_decryption_contrib,
             encrypted_secret_share,
-            details,
+            changes,
             network,
-            address,
+            addresses,
         };
         Ok(vec![DeviceSend::ToUser(Box::new(
             DeviceToUserMessage::SpContactEcdhRequest {
@@ -427,8 +441,8 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
         ))])
     }
 
-    /// The user has confirmed the contact: answer with this device's share of `x * B_scan`, and
-    /// remember the approval for the signature that follows.
+    /// The user has confirmed the change set: answer with this device's share of `x * B_scan` for
+    /// each add, and remember the approval for the signatures that follow. A remove needs no share.
     // Never inlined: inlined into `DeviceLoop::poll` it pushes that frame past the stack budget.
     #[inline(never)]
     pub fn sp_contact_ecdh_ack(
@@ -443,7 +457,7 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
             access_structure_ref,
             coord_share_decryption_contrib,
             encrypted_secret_share,
-            details,
+            changes,
             network,
             ..
         } = phase;
@@ -477,40 +491,45 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
             .non_zero()
             .ok_or_else(|| ActionError::StateInconsistent("account share is zero".into()))?;
 
-        let digest = details.digest(network);
-        let share = silent_payments::prove_ecdh_share(
-            my_index,
-            account_share,
-            details.recipient.scan_key,
-            &digest,
-            rng,
-        )
-        .ok_or_else(|| {
-            ActionError::StateInconsistent("couldn't prove silent payment ECDH share".into())
-        })?;
+        let shares = changes
+            .adds()
+            .map(|details| {
+                silent_payments::prove_ecdh_share(
+                    my_index,
+                    account_share,
+                    details.recipient.scan_key,
+                    &details.digest(network),
+                    rng,
+                )
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                ActionError::StateInconsistent("couldn't prove silent payment ECDH share".into())
+            })?;
 
-        self.sp_contact_approval = Some(digest);
+        self.sp_contact_approval = Some(changes.digest(network));
 
         Ok(vec![DeviceSend::ToCoordinator(Box::new(
             DeviceToCoordinatorMessage::Signing(signing::DeviceSigning::SpContactEcdhShare {
                 session_id,
-                share: Box::new(share),
+                shares,
             }),
         ))])
     }
 
-    /// Whether this device may sign `contact`: the user confirmed exactly these details here, and
-    /// a threshold of proofs under the access structure's own polynomial give its `x * B_scan`.
+    /// Whether this device may sign `changes`: the user confirmed exactly this change set here,
+    /// and for each add a threshold of proofs under the access structure's own polynomial give its
+    /// `x * B_scan`.
     fn check_sp_contact_sign(
         &self,
-        contact: &SpContact,
+        changes: &SpContactChanges,
         network: bitcoin::Network,
         master_appkey: crate::MasterAppkey,
         access_structure_id: AccessStructureId,
         proofs: &signing::SpContactProofs,
     ) -> Result<(), &'static str> {
-        if self.sp_contact_approval != Some(contact.details.digest(network)) {
-            return Err("the user has not confirmed this contact on this device");
+        if self.sp_contact_approval != Some(changes.set.digest(network)) {
+            return Err("the user has not confirmed these contact changes on this device");
         }
         if AccessStructureId::from_app_poly(&proofs.app_poly) != access_structure_id {
             return Err("app polynomial does not match the access structure");
@@ -522,14 +541,21 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
         if app_shared_key.public_key() != master_xpub.key {
             return Err("app polynomial does not commit to the root key");
         }
-        let combined = silent_payments::combine_contact_shares(
-            &Xpub::new(app_shared_key, master_xpub.chaincode),
-            &contact.details,
-            network,
-            &proofs.shares,
-        )?;
-        if combined != contact.account_ecdh {
-            return Err("contact's ECDH value does not match its shares");
+        let app_shared_key = Xpub::new(app_shared_key, master_xpub.chaincode);
+        if proofs.shares.len() != changes.account_ecdh.len() {
+            return Err("contact changes need proofs for each add");
+        }
+        for ((details, shares), account_ecdh) in changes
+            .set
+            .adds()
+            .zip(&proofs.shares)
+            .zip(&changes.account_ecdh)
+        {
+            let combined =
+                silent_payments::combine_contact_shares(&app_shared_key, details, network, shares)?;
+            if combined != *account_ecdh {
+                return Err("contact's ECDH value does not match its shares");
+            }
         }
         Ok(())
     }
@@ -565,16 +591,16 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
             ..
         } = &group_sign_req;
 
-        // A contact is only ever signed from its ECDH round, and only that round signs one.
+        // Contact changes are only ever signed from their ECDH round, and only that round signs them.
         let is_contact = match (&sign_task.inner, &sp_contact_proofs) {
-            (crate::SignTask::SpContact { contact, network }, Some(proofs)) => {
+            (crate::SignTask::SpContactChanges { changes, network }, Some(proofs)) => {
                 // A device that restarted since the user confirmed has forgotten the approval. The
                 // coordinator sends the request again on every reconnect, so ignore it.
-                if self.sp_contact_approval != Some(contact.details.digest(*network)) {
+                if self.sp_contact_approval != Some(changes.set.digest(*network)) {
                     return Ok(vec![]);
                 }
                 self.check_sp_contact_sign(
-                    contact,
+                    changes,
                     *network,
                     sign_task.master_appkey,
                     *access_structure_id,
@@ -583,7 +609,7 @@ impl<S: NonceStreamSlot + core::fmt::Debug> FrostSigner<S> {
                 .map_err(|e| Error::signer_invalid_message(message, e))?;
                 true
             }
-            (crate::SignTask::SpContact { .. }, None) | (_, Some(_)) => {
+            (crate::SignTask::SpContactChanges { .. }, None) | (_, Some(_)) => {
                 return Err(Error::signer_invalid_message(
                     message,
                     "a contact must be signed with its proofs",

@@ -218,6 +218,7 @@ mod tests {
                 },
                 account_ecdh: recipient.scan_key,
             },
+            added_at: frostsnap_core::silent_payments::BookHead::empty(),
             signature: [0u8; 64],
         }
     }

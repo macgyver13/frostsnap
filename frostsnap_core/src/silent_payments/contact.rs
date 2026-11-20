@@ -21,9 +21,9 @@ use schnorr_fun::{
 use sha2::Digest;
 
 use super::{combine_account_ecdh, tagged, verify_ecdh_share, EcdhShare, SilentPaymentRecipient};
+use super::{BookHead, ContactChange};
 use crate::{
-    sign_task::SignItem,
-    tweak::{AppTweak, BitcoinAccount, Xpub},
+    tweak::{BitcoinAccount, Xpub},
     MasterAppkey,
 };
 
@@ -65,28 +65,21 @@ impl SpContactDetails {
     }
 }
 
-/// The record a threshold of devices sign: the details and `x * B_scan` for the account key `x`.
+/// A contact's details and `x * B_scan` for the account key `x`. A threshold of devices sign it as
+/// an add in a contact change set.
 #[derive(bincode::Encode, bincode::Decode, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SpContact {
     pub details: SpContactDetails,
     pub account_ecdh: Point,
 }
 
-impl SpContact {
-    pub fn sign_item(&self, network: Network) -> SignItem {
-        let mut message = self.details.digest(network).to_vec();
-        message.extend_from_slice(&self.account_ecdh.to_bytes());
-        SignItem {
-            message,
-            app_tweak: AppTweak::SpContact,
-        }
-    }
-}
-
-/// A contact with the wallet's signature under [`AppTweak::SpContact`].
+/// A contact in the book, with the wallet's signature on the change that added it under
+/// [`crate::tweak::AppTweak::SpContact`]. `added_at` is the book's head once that change set applied, so the
+/// signature also commits to the head the set applied to and the rest of the set.
 #[derive(bincode::Encode, bincode::Decode, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SignedSpContact {
     pub contact: SpContact,
+    pub added_at: BookHead,
     pub signature: [u8; 64],
 }
 
@@ -98,11 +91,13 @@ impl SignedSpContact {
         if !self.contact.details.has_valid_name() {
             return false;
         }
-        self.contact.sign_item(network).verify_final_signature(
-            &Schnorr::<sha2::Sha256, _>::verify_only(),
-            master_appkey,
-            &signature,
-        )
+        ContactChange::Add(self.contact.details.clone())
+            .sign_item(self.added_at, network, Some(self.contact.account_ecdh))
+            .verify_final_signature(
+                &Schnorr::<sha2::Sha256, _>::verify_only(),
+                master_appkey,
+                &signature,
+            )
     }
 }
 

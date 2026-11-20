@@ -8,8 +8,8 @@ use crate::{
     },
     nonce_stream::{CoordNonceStreamState, NonceStreamId, SigningReqSubSegment},
     silent_payments::{
-        combine_contact_shares, verify_contact_shares, EcdhShare, SignedSpContact, SpContact,
-        SpContactDetails,
+        combine_contact_shares, verify_contact_shares, BookHead, ChangeSetError, ContactBook,
+        ContactChangeSet, EcdhShare, SignedSpContact, SignedSpContactChanges, SpContactChanges,
     },
     symmetric_encryption::{Ciphertext, SymmetricKey},
     tweak::Xpub,
@@ -64,13 +64,13 @@ pub struct FrostCoordinator {
     active_sign_session_order: Vec<SignSessionId>,
     finished_signing_sessions: BTreeMap<SignSessionId, FinishedSignSession>,
     remote_signing: remote_signing::State,
-    /// Contacts being added. In memory only, so that ECDH shares and proofs never reach the
-    /// append-only mutation log: an interrupted ceremony starts again.
+    /// Contact change sets being confirmed. In memory only, so that ECDH shares and proofs never
+    /// reach the append-only mutation log: an interrupted ceremony starts again.
     sp_contact_sessions: BTreeMap<SpContactSessionId, SpContactSession>,
     /// The proofs of each contact signing session. In memory only, like `sp_contact_sessions`.
     sp_contact_sign_proofs: BTreeMap<SignSessionId, SpContactProofs>,
-    /// The trusted contacts of each key, by name.
-    sp_contacts: BTreeMap<KeyId, BTreeMap<String, SignedSpContact>>,
+    /// The contact book of each key.
+    sp_contact_books: BTreeMap<KeyId, ContactBook>,
     restoration: restoration::State,
     remote_keygen: remote_keygen::State,
     pub keygen_fingerprint: schnorr_fun::frost::Fingerprint,
@@ -108,13 +108,14 @@ impl KeyContext {
     }
 }
 
-/// One run of adding a contact, before the wallet signs it.
+/// One run of confirming a contact change set, before the wallet signs it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpContactSession {
     pub access_structure_ref: AccessStructureRef,
-    pub details: SpContactDetails,
+    pub changes: ContactChangeSet,
     pub requested: BTreeSet<DeviceId>,
-    pub shares: BTreeMap<DeviceId, EcdhShare>,
+    /// Each device's ECDH shares, one per add in the order of the adds.
+    pub shares: BTreeMap<DeviceId, Vec<EcdhShare>>,
 }
 
 #[derive(Debug, Clone, bincode::Encode, bincode::Decode, PartialEq)]
@@ -370,7 +371,7 @@ impl FrostCoordinator {
                 self.keys.remove(&key_id)?;
                 self.key_order.retain(|&entry| entry != key_id);
                 self.restoration.clear_up_key_deletion(key_id);
-                self.sp_contacts.remove(&key_id);
+                self.sp_contact_books.remove(&key_id);
                 self.sp_contact_sessions
                     .retain(|_, session| session.access_structure_ref.key_id != key_id);
                 let sessions_to_delete = self
@@ -472,17 +473,26 @@ impl FrostCoordinator {
             Signing(SigningMutation::ForgetFinishedSignSession { session_id }) => {
                 self.finished_signing_sessions.remove(&session_id);
             }
-            Signing(SigningMutation::AddSpContact {
+            Signing(SigningMutation::AddSpContactChanges {
                 key_id,
-                ref contact,
+                ref changes,
             }) => {
-                self.sp_contacts
+                let KeyPurpose::Bitcoin(network) = self.keys.get(&key_id)?.purpose else {
+                    fail!("contact changes for a key that is not a bitcoin key: {key_id}");
+                };
+                let inserted = self
+                    .sp_contact_books
                     .entry(key_id)
-                    .or_default()
-                    .insert(contact.contact.details.name.clone(), (**contact).clone());
+                    .or_insert_with(|| ContactBook::new(network))
+                    .insert((**changes).clone());
+                if !inserted {
+                    return None;
+                }
             }
             Signing(SigningMutation::RemoveSpContact { key_id, ref name }) => {
-                self.sp_contacts.get_mut(&key_id)?.remove(name)?;
+                if !self.sp_contact_books.get_mut(&key_id)?.hide(name) {
+                    return None;
+                }
             }
             Restoration(inner) => {
                 return self
@@ -958,15 +968,15 @@ impl FrostCoordinator {
                 }
             }
             DeviceToCoordinatorMessage::Signing(
-                crate::message::signing::DeviceSigning::SpContactEcdhShare { session_id, share },
+                crate::message::signing::DeviceSigning::SpContactEcdhShare { session_id, shares },
             ) => {
-                self.check_sp_contact_share(from, session_id, &share)
+                self.check_sp_contact_shares(from, session_id, &shares)
                     .map_err(|reason| Error::coordinator_invalid_message(message_kind, reason))?;
                 self.sp_contact_sessions
                     .get_mut(&session_id)
                     .expect("just checked")
                     .shares
-                    .insert(from, *share);
+                    .insert(from, shares);
                 Ok(vec![CoordinatorSend::ToUser(
                     CoordinatorToUserMessage::Signing(
                         CoordinatorToUserSigningMessage::GotSpContactEcdhShare { session_id, from },
@@ -1270,38 +1280,28 @@ impl FrostCoordinator {
         Ok(key_data)
     }
 
-    /// Starts adding the contact `details`: asks `devices`, a threshold or more of the access
-    /// structure, to confirm it and answer with their share of the ECDH. Their answers arrive as
-    /// [`CoordinatorToUserSigningMessage::GotSpContactEcdhShare`], and
-    /// [`Self::start_sp_contact_sign`] takes it from there.
+    /// Starts confirming the contact change set `changes`: asks `devices`, a threshold or more of
+    /// the access structure, to confirm it and answer with their share of the ECDH for each add.
+    /// Their answers arrive as [`CoordinatorToUserSigningMessage::GotSpContactEcdhShare`], and
+    /// [`Self::start_sp_contact_sign`] takes it from there. A single add is a set of one.
     pub fn start_sp_contact(
         &mut self,
         access_structure_ref: AccessStructureRef,
-        details: SpContactDetails,
+        changes: ContactChangeSet,
         devices: &BTreeSet<DeviceId>,
         encryption_key: SymmetricKey,
         rng: &mut impl rand_core::RngCore,
     ) -> Result<(SpContactSessionId, Vec<CoordinatorSend>), StartSignError> {
-        let key_data = self.check_signing_devices(access_structure_ref, devices)?;
-        if !matches!(key_data.purpose, KeyPurpose::Bitcoin(_)) {
-            return Err(StartSignError::SignTask(crate::SignTaskError::WrongPurpose));
-        }
-        if !details.has_valid_name() {
-            return Err(StartSignError::SignTask(
-                crate::SignTaskError::SilentPaymentInvalidContactName,
-            ));
-        }
-        // Contacts are stored by name, so a repeat would replace the address a trusted name pays.
-        if self
-            .sp_contacts(access_structure_ref.key_id)
-            .any(|contact| contact.contact.details.same_name(&details))
-        {
-            return Err(StartSignError::SpContactNameTaken);
-        }
-        // The devices sign right after the holds with no second prompt. Each must have a nonce for
-        // that signature before anyone holds.
+        self.check_signing_devices(access_structure_ref, devices)?;
+        self.check_sp_contact_changes(access_structure_ref.key_id, &changes)?;
+        // The devices sign right after the holds with no second prompt, one signature per change.
+        // Each must have the nonces for those signatures before anyone holds.
         self.nonce_cache
-            .new_signing_session(devices, 1, &self.all_used_nonce_streams())
+            .new_signing_session(
+                devices,
+                changes.changes.len(),
+                &self.all_used_nonce_streams(),
+            )
             .map_err(StartSignError::NotEnoughNoncesForDevice)?;
 
         let mut session_id = [0u8; 32];
@@ -1311,7 +1311,7 @@ impl FrostCoordinator {
             session_id,
             SpContactSession {
                 access_structure_ref,
-                details,
+                changes,
                 requested: devices.clone(),
                 shares: Default::default(),
             },
@@ -1325,6 +1325,28 @@ impl FrostCoordinator {
             self.sp_contact_sessions.remove(&session_id);
         }
         Ok((session_id, sends?))
+    }
+
+    /// Whether `changes` can be confirmed for `key_id`: a bitcoin key, and a set that applies to
+    /// its book as it is now.
+    fn check_sp_contact_changes(
+        &self,
+        key_id: KeyId,
+        changes: &ContactChangeSet,
+    ) -> Result<(), StartSignError> {
+        let network = self
+            .sp_contact_network(key_id)
+            .map_err(|_| StartSignError::SignTask(crate::SignTaskError::WrongPurpose))?;
+        if !changes.is_well_formed() {
+            return Err(StartSignError::SignTask(
+                crate::SignTaskError::SilentPaymentInvalidContactChanges,
+            ));
+        }
+        match self.sp_contact_books.get(&key_id) {
+            Some(book) => book.check(changes),
+            None => ContactBook::new(network).check(changes),
+        }
+        .map_err(StartSignError::SpContactChanges)
     }
 
     /// The ECDH request for one device of a session. A device keeps nothing from an earlier request
@@ -1368,7 +1390,7 @@ impl FrostCoordinator {
                         access_structure_id,
                         share_index,
                         coord_share_decryption_contrib,
-                        details: session.details.clone(),
+                        changes: session.changes.clone(),
                     },
                 )),
             ),
@@ -1384,20 +1406,20 @@ impl FrostCoordinator {
         self.sp_contact_sessions.remove(&session_id);
     }
 
-    /// Forgets the shares `device_id` gave to contacts still being added. A device that disconnects
-    /// loses its approval, so its share could not be followed by its signature. Asking it again
-    /// shows the user the contact again.
+    /// Forgets the shares `device_id` gave to change sets still being confirmed. A device that
+    /// disconnects loses its approval, so its shares could not be followed by its signatures.
+    /// Asking it again shows the user the changes again.
     pub fn forget_sp_contact_shares_from(&mut self, device_id: DeviceId) {
         for session in self.sp_contact_sessions.values_mut() {
             session.shares.remove(&device_id);
         }
     }
 
-    fn check_sp_contact_share(
+    fn check_sp_contact_shares(
         &self,
         from: DeviceId,
         session_id: SpContactSessionId,
-        share: &EcdhShare,
+        shares: &[EcdhShare],
     ) -> Result<(), String> {
         let session = self
             .sp_contact_sessions
@@ -1407,22 +1429,20 @@ impl FrostCoordinator {
             return Err("device was not asked for a contact ECDH share".into());
         }
         if session.shares.contains_key(&from) {
-            return Err("device already sent its contact ECDH share".into());
+            return Err("device already sent its contact ECDH shares".into());
         }
         let access_structure = self
             .get_access_structure(session.access_structure_ref)
             .ok_or("contact session has no access structure")?;
-        if access_structure.device_to_share_index.get(&from) != Some(&share.share_index) {
-            return Err("contact ECDH share is not for this device's share index".into());
-        }
+        let share_index = access_structure.device_to_share_index.get(&from);
         let network = self.sp_contact_network(session.access_structure_ref.key_id)?;
-        verify_contact_shares(
+        check_sp_contact_shares_of(
             &access_structure.app_shared_key(),
-            &session.details,
+            &session.changes,
             network,
-            core::slice::from_ref(share),
+            share_index.copied(),
+            shares,
         )
-        .map_err(String::from)
     }
 
     fn sp_contact_network(&self, key_id: KeyId) -> Result<bitcoin::Network, String> {
@@ -1432,9 +1452,10 @@ impl FrostCoordinator {
         }
     }
 
-    /// Once a threshold of devices have answered, combines their shares into the contact and opens
-    /// the session that signs it. The signers are the devices that answered, which have each
-    /// approved it. The result of the session goes to [`Self::finish_sp_contact`].
+    /// Once a threshold of devices have answered, combines their shares into each add's
+    /// `x * B_scan` and opens the session that signs the change set. The signers are the devices
+    /// that answered, which have each approved it. The result of the session goes to
+    /// [`Self::finish_sp_contact`].
     pub fn start_sp_contact_sign(
         &mut self,
         session_id: SpContactSessionId,
@@ -1458,71 +1479,81 @@ impl FrostCoordinator {
         let network = self
             .sp_contact_network(session.access_structure_ref.key_id)
             .map_err(|_| StartSignError::SignTask(crate::SignTaskError::WrongPurpose))?;
-        let shares = session.shares.values().copied().collect::<Vec<_>>();
-        let account_ecdh = combine_contact_shares(
+        let (changes, proofs) = combine_sp_contact_changes(
             &access_structure.app_shared_key(),
-            &session.details,
+            session.changes,
             network,
-            &shares,
-        )
-        .map_err(|_| StartSignError::CantSignInState {
-            in_state: "contact ECDH shares do not combine",
-        })?;
+            session.shares.values().map(Vec::as_slice),
+        )?;
 
         let sign_session_id = self.start_sign(
             session.access_structure_ref,
-            WireSignTask::SpContact(Box::new(SpContact {
-                details: session.details,
-                account_ecdh,
-            })),
+            WireSignTask::SpContactChanges(Box::new(changes)),
             &answered,
             rng,
         )?;
-        self.sp_contact_sign_proofs.insert(
-            sign_session_id,
-            SpContactProofs {
-                app_poly: access_structure
-                    .app_shared_key()
-                    .key
-                    .point_polynomial()
-                    .to_vec(),
-                shares,
-            },
-        );
+        self.sp_contact_sign_proofs.insert(sign_session_id, proofs);
         self.sp_contact_sessions.remove(&session_id);
         Ok(sign_session_id)
     }
 
-    /// Stores the contact a finished signing session signed, and forgets the session.
-    pub fn finish_sp_contact(&mut self, session_id: SignSessionId) -> Option<SignedSpContact> {
+    /// Applies the change set a finished signing session signed to the book, forgets the session,
+    /// and returns the signed set. It stays out of the book if the book moved on since the set was
+    /// started.
+    pub fn finish_sp_contact(
+        &mut self,
+        session_id: SignSessionId,
+    ) -> Option<SignedSpContactChanges> {
         let finished = self.finished_signing_sessions.get(&session_id)?;
-        let WireSignTask::SpContact(contact) = finished.init.group_request.sign_task.clone() else {
+        let WireSignTask::SpContactChanges(changes) = finished.init.group_request.sign_task.clone()
+        else {
             return None;
         };
         let key_id = finished.key_id;
-        let contact = SignedSpContact {
-            contact: *contact,
-            signature: finished.signatures.first()?.0,
+        let signed = SignedSpContactChanges {
+            changes: *changes,
+            signatures: finished
+                .signatures
+                .iter()
+                .map(|signature| signature.0)
+                .collect(),
         };
-        // A contact added under this name since the session started keeps it.
-        if self
-            .sp_contacts(key_id)
-            .any(|stored| stored.contact.details.same_name(&contact.contact.details))
-        {
-            self.forget_finished_sign_session(session_id);
-            self.sp_contact_sign_proofs.remove(&session_id);
-            return None;
-        }
-        self.mutate(Mutation::Signing(SigningMutation::AddSpContact {
-            key_id,
-            contact: Box::new(contact.clone()),
-        }));
         self.forget_finished_sign_session(session_id);
         self.sp_contact_sign_proofs.remove(&session_id);
-        Some(contact)
+        self.add_sp_contact_changes(key_id, signed.clone()).ok()?;
+        Some(signed)
     }
 
-    /// Settles contact signing sessions left over from an earlier run: finished ones are stored,
+    /// Adds a signed change set to the book of `key_id`, from this coordinator or another one in
+    /// the wallet's group. It is checked against the master appkey and network first. A set the
+    /// book already has, or one for a head the book has passed, changes nothing.
+    pub fn add_sp_contact_changes(
+        &mut self,
+        key_id: KeyId,
+        signed: SignedSpContactChanges,
+    ) -> Result<(), &'static str> {
+        let key = self.keys.get(&key_id).ok_or("unknown key")?;
+        let KeyPurpose::Bitcoin(network) = key.purpose else {
+            return Err("contact changes need a bitcoin key");
+        };
+        if !signed.verify(key.complete_key.master_appkey, network) {
+            return Err("contact changes are not signed by this wallet");
+        }
+        if self
+            .sp_contact_books
+            .get(&key_id)
+            .is_some_and(|book| book.contains(&signed.changes.set.digest(network)))
+        {
+            return Ok(());
+        }
+        self.mutate(Mutation::Signing(SigningMutation::AddSpContactChanges {
+            key_id,
+            changes: Box::new(signed),
+        }));
+        Ok(())
+    }
+
+    /// Settles contact signing sessions left over from an earlier run: finished ones are applied,
     /// and the rest are cancelled because their proofs were in memory.
     pub fn settle_sp_contact_sessions(&mut self) {
         let finished = self
@@ -1531,7 +1562,7 @@ impl FrostCoordinator {
             .filter(|(_, session)| {
                 matches!(
                     session.init.group_request.sign_task,
-                    WireSignTask::SpContact(_)
+                    WireSignTask::SpContactChanges(_)
                 )
             })
             .map(|(session_id, _)| *session_id)
@@ -1545,7 +1576,7 @@ impl FrostCoordinator {
             .filter(|(session_id, session)| {
                 matches!(
                     session.init.group_request.sign_task,
-                    WireSignTask::SpContact(_)
+                    WireSignTask::SpContactChanges(_)
                 ) && !self.sp_contact_sign_proofs.contains_key(session_id)
             })
             .map(|(session_id, _)| *session_id)
@@ -1555,14 +1586,29 @@ impl FrostCoordinator {
         }
     }
 
-    /// The trusted contacts of `key_id`, by name.
-    pub fn sp_contacts(&self, key_id: KeyId) -> impl Iterator<Item = &SignedSpContact> {
-        self.sp_contacts
-            .get(&key_id)
-            .into_iter()
-            .flat_map(|c| c.values())
+    /// The contact book of `key_id`, if any change set has been added to it.
+    pub fn sp_contact_book(&self, key_id: KeyId) -> Option<&ContactBook> {
+        self.sp_contact_books.get(&key_id)
     }
 
+    /// The head of the contact book of `key_id`. A change set started now applies to it.
+    pub fn sp_contact_book_head(&self, key_id: KeyId) -> BookHead {
+        self.sp_contact_books
+            .get(&key_id)
+            .map(ContactBook::head)
+            .unwrap_or_else(BookHead::empty)
+    }
+
+    /// The trusted contacts of `key_id`.
+    pub fn sp_contacts(&self, key_id: KeyId) -> impl Iterator<Item = &SignedSpContact> {
+        self.sp_contact_books
+            .get(&key_id)
+            .into_iter()
+            .flat_map(ContactBook::contacts)
+    }
+
+    /// Stops showing a contact on this coordinator only, for a wallet with no nostr channel. On a
+    /// nostr wallet a removal is a change set every coordinator applies.
     pub fn remove_sp_contact(&mut self, key_id: KeyId, name: String) {
         self.mutate(Mutation::Signing(SigningMutation::RemoveSpContact {
             key_id,
@@ -1939,14 +1985,15 @@ impl FrostCoordinator {
 
     pub fn cancel_sign_session(&mut self, session_id: SignSessionId) {
         self.sp_contact_sign_proofs.remove(&session_id);
-        // A contact the user walked away from must not be stored by `settle_sp_contact_sessions`.
+        // Contact changes the user walked away from must not be applied by
+        // `settle_sp_contact_sessions`.
         if self
             .finished_signing_sessions
             .get(&session_id)
             .is_some_and(|session| {
                 matches!(
                     session.init.group_request.sign_task,
-                    WireSignTask::SpContact(_)
+                    WireSignTask::SpContactChanges(_)
                 )
             })
         {
@@ -2363,7 +2410,7 @@ pub enum StartSignError {
     /// first. Remote sessions commit to those values at offer time.
     ConflictingRemoteSignSession,
     NoSuchSpContactSession,
-    SpContactNameTaken,
+    SpContactChanges(ChangeSetError),
 }
 
 impl fmt::Display for StartSignError {
@@ -2382,11 +2429,9 @@ impl fmt::Display for StartSignError {
                 write!(f, "Can't sign in state {in_state}")
             }
             StartSignError::NoSuchSpContactSession => {
-                write!(f, "That contact is no longer being added")
+                write!(f, "Those contact changes are no longer being confirmed")
             }
-            StartSignError::SpContactNameTaken => {
-                write!(f, "This wallet already has a contact with that name")
-            }
+            StartSignError::SpContactChanges(error) => error.fmt(f),
             StartSignError::NotEnoughNoncesForDevice(not_enough_nonces) => not_enough_nonces.fmt(f),
             StartSignError::DeviceNotPartOfKey { device_id } => {
                 write!(
@@ -2667,4 +2712,71 @@ impl IntoIterator for SendFinalizeKeygen {
             destinations: self.local_devices.into_iter().collect(),
         })
     }
+}
+
+/// Checks the ECDH shares one device gave for the adds of `changes`: one per add, in order, each
+/// from `share_index` and with a valid proof for that add's details.
+fn check_sp_contact_shares_of(
+    app_shared_key: &Xpub<SharedKey>,
+    changes: &ContactChangeSet,
+    network: bitcoin::Network,
+    share_index: Option<ShareIndex>,
+    shares: &[EcdhShare],
+) -> Result<(), String> {
+    if shares.len() != changes.adds().count() {
+        return Err("contact ECDH shares are not one per add".into());
+    }
+    for (details, share) in changes.adds().zip(shares) {
+        if Some(share.share_index) != share_index {
+            return Err("contact ECDH share is not for this device's share index".into());
+        }
+        verify_contact_shares(
+            app_shared_key,
+            details,
+            network,
+            core::slice::from_ref(share),
+        )?;
+    }
+    Ok(())
+}
+
+/// Combines a threshold of devices' ECDH shares, each one per add of `changes` in order, into the
+/// change set the wallet signs and the proofs each signer checks it against.
+fn combine_sp_contact_changes<'a>(
+    app_shared_key: &Xpub<SharedKey>,
+    changes: ContactChangeSet,
+    network: bitcoin::Network,
+    shares_by_device: impl Iterator<Item = &'a [EcdhShare]> + Clone,
+) -> Result<(SpContactChanges, SpContactProofs), StartSignError> {
+    let shares_by_add = changes
+        .adds()
+        .enumerate()
+        .map(|(i, _)| {
+            shares_by_device
+                .clone()
+                .map(|shares| shares.get(i).copied())
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or(StartSignError::CantSignInState {
+            in_state: "contact ECDH shares are not one per add",
+        })?;
+    let account_ecdh = changes
+        .adds()
+        .zip(&shares_by_add)
+        .map(|(details, shares)| combine_contact_shares(app_shared_key, details, network, shares))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| StartSignError::CantSignInState {
+            in_state: "contact ECDH shares do not combine",
+        })?;
+    Ok((
+        SpContactChanges {
+            set: changes,
+            account_ecdh,
+        },
+        SpContactProofs {
+            app_poly: app_shared_key.key().point_polynomial().to_vec(),
+            shares: shares_by_add,
+        },
+    ))
 }

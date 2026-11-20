@@ -1063,6 +1063,7 @@ mod test {
                     },
                     account_ecdh: key,
                 },
+                added_at: frostsnap_core::silent_payments::BookHead::empty(),
                 signature: [0u8; 64],
             }),
             address: "sp1example".into(),

@@ -15,7 +15,8 @@ use frostsnap_core::message::HeldShare2;
 use frostsnap_core::message::{EncodedSignature, GroupSignReq};
 use frostsnap_core::nonce_stream::{CoordNonceStreamState, NonceStreamId, NonceStreamSegment};
 use frostsnap_core::silent_payments::{
-    SignedSpContact, SilentPaymentRecipient, SpContact, SpContactDetails,
+    BookHead, ContactChange, ContactChangeSet, SignedSpContactChanges, SilentPaymentRecipient,
+    SpContactChanges, SpContactDetails,
 };
 use frostsnap_core::tweak::AppTweak;
 use frostsnap_core::tweak::Xpub;
@@ -347,20 +348,35 @@ fn test_all_coordinator_mutations() {
         Mutation::RemoteSigning(RemoteSigningMutation::CancelRemoteSignSession {
             id: RemoteSignSessionId::from_binonces(&[test_nonce]),
         }),
-        Mutation::Signing(SigningMutation::AddSpContact {
+        Mutation::Signing(SigningMutation::AddSpContactChanges {
             key_id: KeyId([3u8; 32]),
-            contact: Box::new(SignedSpContact {
-                contact: SpContact {
-                    details: SpContactDetails {
-                        name: "Alice".to_string(),
-                        recipient: SilentPaymentRecipient {
-                            scan_key: g!(42 * G).normalize(),
-                            spend_key: g!(43 * G).normalize(),
+            changes: Box::new(SignedSpContactChanges {
+                changes: SpContactChanges {
+                    set: ContactChangeSet {
+                        head: BookHead {
+                            version: 1,
+                            hash: [15u8; 32],
                         },
+                        changes: vec![
+                            ContactChange::Remove(SpContactDetails {
+                                name: "Bob".to_string(),
+                                recipient: SilentPaymentRecipient {
+                                    scan_key: g!(45 * G).normalize(),
+                                    spend_key: g!(46 * G).normalize(),
+                                },
+                            }),
+                            ContactChange::Add(SpContactDetails {
+                                name: "Alice".to_string(),
+                                recipient: SilentPaymentRecipient {
+                                    scan_key: g!(42 * G).normalize(),
+                                    spend_key: g!(43 * G).normalize(),
+                                },
+                            }),
+                        ],
                     },
-                    account_ecdh: g!(44 * G).normalize(),
+                    account_ecdh: vec![g!(44 * G).normalize()],
                 },
-                signature: [14u8; 64],
+                signatures: vec![[14u8; 64], [16u8; 64]],
             }),
         }),
         Mutation::Signing(SigningMutation::RemoveSpContact {
@@ -483,10 +499,10 @@ fn test_all_coordinator_mutations() {
                     "01050c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
                 );
             }
-            Mutation::Signing(SigningMutation::AddSpContact { .. }) => {
+            Mutation::Signing(SigningMutation::AddSpContactChanges { .. }) => {
                 assert_bincode_hex_eq!(
                     mutation,
-                    "0106030303030303030303030303030303030303030303030303030303030303030305416c69636502fe8d1eb1bcb3432b1db5833ff5f2226d9cb5e65cee430558c18ed3a3c86ce1af03d528ecd9b696b54c907a9ed045447a79bb408ec39b68df504bb51f459bc3ffc9025d045857332d5b9e541514731622af8d60c180165d971a61e06b70a9b38347650e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e"
+                    "01060303030303030303030303030303030303030303030303030303030303030303010f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f020103426f6202049370a4b5f43412ea25f514e8ecdad05266115e4a7ecb1387231808f8b4596303f8b0b03d44112259f903b3d100e3950d980fdde9c7e85701c16baedc902357170005416c69636502fe8d1eb1bcb3432b1db5833ff5f2226d9cb5e65cee430558c18ed3a3c86ce1af03d528ecd9b696b54c907a9ed045447a79bb408ec39b68df504bb51f459bc3ffc901025d045857332d5b9e541514731622af8d60c180165d971a61e06b70a9b3834765020e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e10101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010"
                 );
             }
             Mutation::Signing(SigningMutation::RemoveSpContact { .. }) => {

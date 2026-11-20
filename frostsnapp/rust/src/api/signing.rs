@@ -207,8 +207,17 @@ impl WireSignTaskExt for WireSignTask {
                 content: event.content.clone(),
                 hash_bytes: event.hash_bytes.to_lower_hex_string(),
             },
-            WireSignTask::SpContact(contact) => SigningDetails::Message {
-                message: format!("Add contact {}", contact.details.name),
+            WireSignTask::SpContactChanges(changes) => SigningDetails::Message {
+                message: changes
+                    .set
+                    .changes
+                    .iter()
+                    .map(|change| {
+                        let kind = if change.is_remove() { "Remove" } else { "Add" };
+                        format!("{kind} contact {}", change.details().name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
             },
             WireSignTask::BitcoinTransaction(tx_temp) => {
                 let raw_tx = tx_temp.to_rust_bitcoin_tx();
@@ -596,9 +605,9 @@ impl Coordinator {
             WireSignTask::BitcoinTransaction(template) => Some(UnsignedTx {
                 template_tx: template.clone(),
             }),
-            WireSignTask::Test { .. } | WireSignTask::Nostr { .. } | WireSignTask::SpContact(_) => {
-                None
-            }
+            WireSignTask::Test { .. }
+            | WireSignTask::Nostr { .. }
+            | WireSignTask::SpContactChanges(_) => None,
         };
         let session_id = {
             let mut db = self.0.db.lock().unwrap();
@@ -679,9 +688,9 @@ impl Coordinator {
             WireSignTask::BitcoinTransaction(template) => Some(UnsignedTx {
                 template_tx: template.clone(),
             }),
-            WireSignTask::Test { .. } | WireSignTask::Nostr { .. } | WireSignTask::SpContact(_) => {
-                None
-            }
+            WireSignTask::Test { .. }
+            | WireSignTask::Nostr { .. }
+            | WireSignTask::SpContactChanges(_) => None,
         };
         let state_broadcast = BehaviorBroadcast::seeded(active_sign_session.state());
         let (dispatcher, dispatcher_tx) = SigningDispatcher::restore_signing_session(
@@ -738,9 +747,9 @@ impl Coordinator {
             WireSignTask::BitcoinTransaction(template) => Some(UnsignedTx {
                 template_tx: template.clone(),
             }),
-            WireSignTask::Test { .. } | WireSignTask::Nostr { .. } | WireSignTask::SpContact(_) => {
-                None
-            }
+            WireSignTask::Test { .. }
+            | WireSignTask::Nostr { .. }
+            | WireSignTask::SpContactChanges(_) => None,
         };
         let session_id = frostsnap_core::message::GroupSignReq::from_binonces(
             sign_task,

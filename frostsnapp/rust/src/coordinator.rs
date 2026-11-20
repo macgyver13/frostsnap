@@ -41,7 +41,9 @@ use frostsnap_core::coordinator::{
 };
 use frostsnap_core::device::KeyPurpose;
 use frostsnap_core::message::signing::SpContactSessionId;
-use frostsnap_core::silent_payments::{SilentPaymentRecipient, SpContactDetails};
+use frostsnap_core::silent_payments::{
+    ContactChange, ContactChangeSet, SilentPaymentRecipient, SpContactDetails,
+};
 use frostsnap_core::{
     message, schnorr_fun::frost::ShareIndex, AccessStructureRef, DeviceId, KeyId, KeygenId,
     RestorationId, SignSessionId, SymmetricKey, WireSignTask,
@@ -514,7 +516,8 @@ impl FfiCoordinator {
         Ok(())
     }
 
-    /// Asks `devices` to confirm a contact and answer with their ECDH share. The devices connected
+    /// Asks `devices` to confirm adding a contact, a change set of one against the local book, and
+    /// answer with their ECDH share. The devices connected
     /// and ready now are asked at once; the caller asks the rest with
     /// [`Self::request_sp_contact_ecdh`] when the state lists one in `connected_but_need_request`.
     pub fn start_sp_contact(
@@ -538,10 +541,14 @@ impl FfiCoordinator {
         let recipient = SilentPaymentRecipient::from_address(&address, network).ok_or(anyhow!(
             "This is not a silent payment address on this network"
         ))?;
+        let changes = ContactChangeSet {
+            head: coordinator.sp_contact_book_head(access_structure_ref.key_id),
+            changes: vec![ContactChange::Add(SpContactDetails { name, recipient })],
+        };
         let (session_id, sends) = coordinator.staged_mutate(&mut *db, |coordinator| {
             Ok(coordinator.start_sp_contact(
                 access_structure_ref,
-                SpContactDetails { name, recipient },
+                changes,
                 &devices,
                 encryption_key,
                 &mut rand::thread_rng(),
@@ -611,14 +618,14 @@ impl FfiCoordinator {
         Ok(sign_session_id)
     }
 
-    /// Stores the contact a finished signing session signed.
+    /// Applies the change set a finished signing session signed to the contact book.
     pub fn finish_sp_contact(&self, session_id: SignSessionId) -> anyhow::Result<()> {
         let mut db = self.db.lock().unwrap();
         let mut coordinator = self.coordinator.lock().unwrap();
         coordinator.staged_mutate(&mut *db, |coordinator| {
             coordinator
                 .finish_sp_contact(session_id)
-                .ok_or(anyhow!("that session did not sign a contact"))?;
+                .ok_or(anyhow!("that session did not sign contact changes"))?;
             Ok(())
         })
     }

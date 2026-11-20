@@ -8,10 +8,12 @@
 //! sender would compute from the summed input secret.
 
 mod address;
+mod book;
 mod contact;
 mod dleq;
 mod template;
 
+pub use book::*;
 pub use contact::*;
 pub use dleq::{dleq_prove, dleq_verify};
 

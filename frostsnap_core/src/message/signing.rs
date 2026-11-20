@@ -1,6 +1,6 @@
 use crate::{
     nonce_stream::{CoordNonceStreamState, NonceStreamSegment},
-    silent_payments::{EcdhShare, SpContactDetails},
+    silent_payments::{ContactChangeSet, EcdhShare},
     AccessStructureId, CoordShareDecryptionContrib, Kind, ShareIndex, SignSessionId,
 };
 use alloc::{boxed::Box, vec::Vec};
@@ -48,19 +48,21 @@ pub enum DeviceSigning {
         signature_shares: Vec<SignatureShare>,
         replenish_nonces: Option<NonceStreamSegment>,
     },
+    /// One ECDH share per add of the change set, in the order of the adds.
     SpContactEcdhShare {
         session_id: SpContactSessionId,
-        share: Box<EcdhShare>,
+        shares: Vec<EcdhShare>,
     },
 }
 
-/// Identifies one run of adding a contact, before the wallet signs it.
+/// Identifies one run of changing the contact book, before the wallet signs the changes.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, bincode::Encode, bincode::Decode,
 )]
 pub struct SpContactSessionId(pub [u8; 32]);
 
-/// Asks a device to confirm a contact with the user and answer with its share of the ECDH.
+/// Asks a device to confirm a contact change set with the user and answer with its share of the
+/// ECDH for each add.
 #[derive(Clone, Debug, bincode::Encode, bincode::Decode, PartialEq)]
 pub struct RequestSpContactEcdh {
     pub session_id: SpContactSessionId,
@@ -69,18 +71,20 @@ pub struct RequestSpContactEcdh {
     /// The share the device answers with, in case it holds more than one.
     pub share_index: ShareIndex,
     pub coord_share_decryption_contrib: CoordShareDecryptionContrib,
-    pub details: SpContactDetails,
+    pub changes: ContactChangeSet,
 }
 
-/// What a device checks a contact's `x * B_scan` against before signing it: the public polynomial
-/// the access structure is identified by, and the ECDH shares of a threshold of parties.
+/// What a device checks each added contact's `x * B_scan` against before signing a change set: the
+/// public polynomial the access structure is identified by, and for each add, in order, the ECDH
+/// shares of a threshold of parties.
 #[derive(Clone, Debug, bincode::Encode, bincode::Decode, PartialEq)]
 pub struct SpContactProofs {
     pub app_poly: Vec<Point<Normal, Public, Zero>>,
-    pub shares: Vec<EcdhShare>,
+    pub shares: Vec<Vec<EcdhShare>>,
 }
 
-/// A sign request for a contact, carrying the proofs the signing session itself does not keep.
+/// A sign request for a contact change set, carrying the proofs the signing session itself does not
+/// keep.
 #[derive(Debug, Clone, bincode::Encode, bincode::Decode, PartialEq)]
 pub struct RequestSpContactSign {
     pub request_sign: super::RequestSign,

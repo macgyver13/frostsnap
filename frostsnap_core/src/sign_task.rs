@@ -13,7 +13,7 @@ pub enum WireSignTask {
         event: Box<crate::nostr::UnsignedEvent>,
     },
     BitcoinTransaction(bitcoin_transaction::TransactionTemplate),
-    SpContact(Box<crate::silent_payments::SpContact>),
+    SpContactChanges(Box<crate::silent_payments::SpContactChanges>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,8 +28,8 @@ pub enum SignTask {
         tx_template: bitcoin_transaction::TransactionTemplate,
         network: bitcoin::Network,
     },
-    SpContact {
-        contact: Box<crate::silent_payments::SpContact>,
+    SpContactChanges {
+        changes: Box<crate::silent_payments::SpContactChanges>,
         network: bitcoin::Network,
     },
 }
@@ -126,15 +126,15 @@ impl WireSignTask {
                     network,
                 }
             }
-            WireSignTask::SpContact(contact) => {
+            WireSignTask::SpContactChanges(changes) => {
                 let network = match purpose {
                     KeyPurpose::Bitcoin(network) => network,
                     _ => return Err(SignTaskError::WrongPurpose),
                 };
-                if !contact.details.has_valid_name() {
-                    return Err(SignTaskError::SilentPaymentInvalidContactName);
+                if !changes.is_well_formed() {
+                    return Err(SignTaskError::SilentPaymentInvalidContactChanges);
                 }
-                SignTask::SpContact { contact, network }
+                SignTask::SpContactChanges { changes, network }
             }
         };
         Ok(CheckedSignTask {
@@ -182,7 +182,7 @@ impl CheckedSignTask {
                     }
                 })
                 .collect(),
-            SignTask::SpContact { contact, network } => vec![contact.sign_item(*network)],
+            SignTask::SpContactChanges { changes, network } => changes.sign_items(*network),
         }
     }
 }
@@ -229,7 +229,7 @@ pub enum SignTaskError {
     SilentPaymentScriptMissing,
     SilentPaymentScriptMismatch,
     SilentPaymentUntrustedContact,
-    SilentPaymentInvalidContactName,
+    SilentPaymentInvalidContactChanges,
 }
 
 impl core::fmt::Display for SignTaskError {
@@ -243,9 +243,9 @@ impl core::fmt::Display for SignTaskError {
                 f,
                 "A silent payment output pays a contact this wallet has not signed"
             ),
-            SignTaskError::SilentPaymentInvalidContactName => write!(
+            SignTaskError::SilentPaymentInvalidContactChanges => write!(
                 f,
-                "A contact name must be 1 to 20 printable ASCII characters"
+                "Each contact change needs a name of 1 to 20 printable ASCII characters, used once"
             ),
             SignTaskError::WrongKey { got, expected } => write!(
                 f,

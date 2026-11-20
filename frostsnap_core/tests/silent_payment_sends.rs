@@ -11,7 +11,8 @@ use frostsnap_core::{
         CoordinatorToDeviceMessage,
     },
     silent_payments::{
-        verify_contact_shares, SignedSpContact, SilentPaymentRecipient, SpContact, SpContactDetails,
+        verify_contact_shares, ChangeSetError, ContactChange, ContactChangeSet, SignedSpContact,
+        SignedSpContactChanges, SilentPaymentRecipient, SpContactChanges, SpContactDetails,
     },
     tweak::BitcoinBip32Path,
     AccessStructureRef, DeviceId, MasterAppkey, SignTaskError, WireSignTask,
@@ -87,19 +88,31 @@ impl Wallet {
         indices.iter().map(|i| self.devices[*i]).collect()
     }
 
-    /// Runs the ECDH round of adding `details` on `signers`, stopping before anything is signed.
-    fn contact_ecdh(
+    /// `changes` to the book as it is now.
+    fn change_set(&self, changes: Vec<ContactChange>) -> ContactChangeSet {
+        ContactChangeSet {
+            head: self
+                .run
+                .coordinator
+                .sp_contact_book_head(self.access_structure_ref.key_id),
+            changes,
+        }
+    }
+
+    /// Runs the ECDH round of `changes` on `signers`, stopping before anything is signed.
+    fn changes_ecdh(
         &mut self,
-        details: SpContactDetails,
+        changes: Vec<ContactChange>,
         signers: &[usize],
     ) -> frostsnap_core::message::signing::SpContactSessionId {
+        let set = self.change_set(changes);
         let signers = self.signers(signers);
         let (session_id, sends) = self
             .run
             .coordinator
             .start_sp_contact(
                 self.access_structure_ref,
-                details,
+                set,
                 &signers,
                 TEST_ENCRYPTION_KEY,
                 &mut self.rng,
@@ -112,27 +125,51 @@ impl Wallet {
         session_id
     }
 
-    fn add_contact(&mut self, details: SpContactDetails, signers: &[usize]) -> SignedSpContact {
-        let session_id = self.contact_ecdh(details, signers);
-        let sign_session = self
-            .run
-            .coordinator
-            .start_sp_contact_sign(session_id, &mut self.rng)
-            .unwrap();
-        for device in self.signers(signers) {
-            let request =
-                self.run
-                    .coordinator
-                    .request_device_sign(sign_session, device, TEST_ENCRYPTION_KEY);
-            self.run.extend(request);
-        }
-        self.run
-            .run_until_finished(&mut self.env, &mut self.rng)
-            .unwrap();
+    /// Runs the ECDH round of adding `details` on `signers`.
+    fn contact_ecdh(
+        &mut self,
+        details: SpContactDetails,
+        signers: &[usize],
+    ) -> frostsnap_core::message::signing::SpContactSessionId {
+        self.changes_ecdh(vec![ContactChange::Add(details)], signers)
+    }
+
+    /// Confirms and signs `changes` on `signers` and applies them to the book.
+    fn change_book(
+        &mut self,
+        changes: Vec<ContactChange>,
+        signers: &[usize],
+    ) -> SignedSpContactChanges {
+        let sign_session = sign_changes(self, changes, signers);
         self.run
             .coordinator
             .finish_sp_contact(sign_session)
             .unwrap()
+    }
+
+    fn add_contact(&mut self, details: SpContactDetails, signers: &[usize]) -> SignedSpContact {
+        let name = details.name.clone();
+        self.change_book(vec![ContactChange::Add(details)], signers);
+        self.contact(&name).unwrap()
+    }
+
+    fn contact(&self, name: &str) -> Option<SignedSpContact> {
+        self.run
+            .coordinator
+            .sp_contact_book(self.access_structure_ref.key_id)?
+            .by_name(name)
+            .cloned()
+    }
+
+    fn names(&self) -> Vec<String> {
+        let mut names = self
+            .run
+            .coordinator
+            .sp_contacts(self.access_structure_ref.key_id)
+            .map(|contact| contact.contact.details.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     fn template_paying(&self, contact: &SignedSpContact) -> TransactionTemplate {
@@ -197,10 +234,7 @@ fn any_quorum_adds_the_same_contact_under_the_wallet_signature() {
     let key_id = wallet.access_structure_ref.key_id;
     let by_first = wallet.add_contact(details.clone(), &[0, 1]);
     assert_eq!(wallet.run.coordinator.sp_contacts(key_id).count(), 1);
-    wallet
-        .run
-        .coordinator
-        .remove_sp_contact(key_id, "Alice".into());
+    wallet.change_book(vec![ContactChange::Remove(details.clone())], &[0, 2]);
     assert_eq!(wallet.run.coordinator.sp_contacts(key_id).count(), 0);
     let by_last = wallet.add_contact(details, &[1, 2]);
 
@@ -399,9 +433,10 @@ fn the_prompt_shows_the_contact_and_hides_single_change() {
 fn a_contact_is_not_signed_below_the_threshold() {
     let mut wallet = Wallet::new();
     let signers = wallet.signers(&[0]);
+    let set = wallet.change_set(vec![ContactChange::Add(details("Judy", 0x93, 0x94))]);
     let refused = wallet.run.coordinator.start_sp_contact(
         wallet.access_structure_ref,
-        details("Judy", 0x93, 0x94),
+        set,
         &signers,
         TEST_ENCRYPTION_KEY,
         &mut wallet.rng,
@@ -420,12 +455,13 @@ fn a_contact_is_not_signed_below_the_threshold() {
         .unwrap();
     assert_eq!(session.shares.len(), 2);
     let signers = wallet.signers(&[0, 1]);
+    let set = wallet.change_set(vec![ContactChange::Add(details("Ivan", 0x91, 0x92))]);
     let (unanswered, _sends) = wallet
         .run
         .coordinator
         .start_sp_contact(
             wallet.access_structure_ref,
-            details("Ivan", 0x91, 0x92),
+            set,
             &signers,
             TEST_ENCRYPTION_KEY,
             &mut wallet.rng,
@@ -459,7 +495,7 @@ fn a_device_only_signs_the_contact_its_user_confirmed() {
 
     // With fewer proofs than the threshold.
     let mut below_threshold = request.clone();
-    below_threshold.proofs.shares.pop();
+    below_threshold.proofs.shares[0].pop();
     assert!(!wallet.device_accepts(
         0,
         CoordinatorSigning::RequestSpContactSign(Box::new(below_threshold))
@@ -467,10 +503,14 @@ fn a_device_only_signs_the_contact_its_user_confirmed() {
 
     // With a value the proofs do not give.
     let mut wrong_ecdh = request.clone();
+    let WireSignTask::SpContactChanges(changes) = &request.request_sign.group_sign_req.sign_task
+    else {
+        panic!("a contact request signs contact changes");
+    };
     wrong_ecdh.request_sign.group_sign_req.sign_task =
-        WireSignTask::SpContact(Box::new(SpContact {
-            details: details.clone(),
-            account_ecdh: public(scalar(0xa3)),
+        WireSignTask::SpContactChanges(Box::new(SpContactChanges {
+            set: changes.set.clone(),
+            account_ecdh: vec![public(scalar(0xa3))],
         }));
     assert!(!wallet.device_accepts(
         0,
@@ -506,7 +546,11 @@ fn a_proof_does_not_carry_over_to_other_details() {
         .sp_contact_session(session_id)
         .unwrap()
         .clone();
-    let shares = session.shares.values().copied().collect::<Vec<_>>();
+    let shares = session
+        .shares
+        .values()
+        .map(|shares| shares[0])
+        .collect::<Vec<_>>();
     let key = wallet
         .run
         .coordinator
@@ -537,12 +581,13 @@ fn a_device_answers_with_the_share_the_request_names() {
     };
     let mut wallet = Wallet::new();
     let signers = wallet.signers(&[0, 1]);
+    let set = wallet.change_set(vec![ContactChange::Add(details("Pia", 0xe1, 0xe2))]);
     let (_, sends) = wallet
         .run
         .coordinator
         .start_sp_contact(
             wallet.access_structure_ref,
-            details("Pia", 0xe1, 0xe2),
+            set,
             &signers,
             TEST_ENCRYPTION_KEY,
             &mut wallet.rng,
@@ -643,10 +688,16 @@ fn a_contact_is_not_started_without_nonces() {
         .unwrap()
         .access_structure_ref();
     let signers = run.device_vec().into_iter().take(2).collect();
+    let set = ContactChangeSet {
+        head: run
+            .coordinator
+            .sp_contact_book_head(access_structure_ref.key_id),
+        changes: vec![ContactChange::Add(details("Quinn", 0xf1, 0xf2))],
+    };
     assert!(matches!(
         run.coordinator.start_sp_contact(
             access_structure_ref,
-            details("Quinn", 0xf1, 0xf2),
+            set,
             &signers,
             TEST_ENCRYPTION_KEY,
             &mut rng,
@@ -667,16 +718,17 @@ fn contact_names_are_short_printable_ascii() {
 
     let mut wallet = Wallet::new();
     let signers = wallet.signers(&[0, 1]);
+    let set = wallet.change_set(vec![ContactChange::Add(details("", 1, 2))]);
     assert!(matches!(
         wallet.run.coordinator.start_sp_contact(
             wallet.access_structure_ref,
-            details("", 1, 2),
+            set,
             &signers,
             TEST_ENCRYPTION_KEY,
             &mut wallet.rng,
         ),
         Err(StartSignError::SignTask(
-            SignTaskError::SilentPaymentInvalidContactName
+            SignTaskError::SilentPaymentInvalidContactChanges
         ))
     ));
 }
@@ -687,15 +739,16 @@ fn a_contact_name_cannot_be_reused() {
     let added = wallet.add_contact(details("Alice", 1, 2), &[0, 1]);
     let signers = wallet.signers(&[0, 1]);
     for name in ["Alice", "aLICE"] {
+        let set = wallet.change_set(vec![ContactChange::Add(details(name, 3, 4))]);
         assert!(matches!(
             wallet.run.coordinator.start_sp_contact(
                 wallet.access_structure_ref,
-                details(name, 3, 4),
+                set,
                 &signers,
                 TEST_ENCRYPTION_KEY,
                 &mut wallet.rng,
             ),
-            Err(StartSignError::SpContactNameTaken)
+            Err(StartSignError::SpContactChanges(ChangeSetError::NameTaken))
         ));
     }
     let key_id = wallet.access_structure_ref.key_id;
@@ -715,7 +768,16 @@ fn sign_contact(
     details: SpContactDetails,
     signers: &[usize],
 ) -> frostsnap_core::SignSessionId {
-    let session_id = wallet.contact_ecdh(details, signers);
+    sign_changes(wallet, vec![ContactChange::Add(details)], signers)
+}
+
+/// Runs `changes` on `signers` until the devices have signed, without applying them.
+fn sign_changes(
+    wallet: &mut Wallet,
+    changes: Vec<ContactChange>,
+    signers: &[usize],
+) -> frostsnap_core::SignSessionId {
+    let session_id = wallet.changes_ecdh(changes, signers);
     let sign_session = wallet
         .run
         .coordinator
@@ -751,24 +813,92 @@ fn a_contact_cancelled_after_signing_is_not_stored() {
     assert_eq!(wallet.run.coordinator.sp_contacts(key_id).count(), 0);
 }
 
-/// A signed contact that was never stored does not replace one added under its name since.
+/// Two change sets from the same head can both be signed. Whichever finishes first, the one with
+/// the smaller digest is the book's.
 #[test]
-fn a_late_contact_does_not_replace_its_name() {
+fn of_two_change_sets_from_one_head_the_smaller_digest_wins() {
     let mut wallet = Wallet::new();
-    let late = sign_contact(&mut wallet, details("Bob", 0x31, 0x32), &[0, 1]);
-    let added = wallet.add_contact(details("bob", 0x33, 0x34), &[0, 1]);
+    let first = sign_contact(&mut wallet, details("Bob", 0x31, 0x32), &[0, 1]);
+    let second = sign_contact(&mut wallet, details("bob", 0x33, 0x34), &[1, 2]);
+    let other = wallet.run.coordinator.clone();
 
-    assert_eq!(wallet.run.coordinator.finish_sp_contact(late), None);
+    let second = wallet.run.coordinator.finish_sp_contact(second).unwrap();
+    let first = wallet.run.coordinator.finish_sp_contact(first).unwrap();
     assert_eq!(wallet.run.coordinator.finished_signing_sessions().len(), 0);
+    assert_eq!(first.changes.set.head, second.changes.set.head);
+
+    let winner = [&first, &second]
+        .into_iter()
+        .min_by_key(|signed| signed.changes.set.digest(NETWORK))
+        .unwrap();
     let key_id = wallet.access_structure_ref.key_id;
+    let head = wallet.run.coordinator.sp_contact_book_head(key_id);
+    assert_eq!(head, winner.changes.set.next_head(NETWORK));
     assert_eq!(
         wallet
             .run
             .coordinator
             .sp_contacts(key_id)
             .collect::<Vec<_>>(),
-        vec![&added]
+        winner.added_contacts(NETWORK).iter().collect::<Vec<_>>()
     );
+
+    // Another coordinator that gets them the other way round agrees.
+    let mut other = other;
+    other.add_sp_contact_changes(key_id, first.clone()).unwrap();
+    other
+        .add_sp_contact_changes(key_id, second.clone())
+        .unwrap();
+    assert_eq!(other.sp_contact_book_head(key_id), head);
+    // The losing set is known, not waiting for anything, and reported dropped.
+    let loser = if winner == &first { &second } else { &first };
+    let book = other.sp_contact_book(key_id).unwrap();
+    assert!(!book.is_waiting_for_missing_set());
+    assert_eq!(book.dropped(), [loser]);
+}
+
+/// A set from an old head that arrives late can't displace a set that already has a descendant:
+/// the longer branch wins even when the late set has the smaller digest, on every coordinator
+/// whatever the arrival order, and the late set is reported dropped.
+#[test]
+fn a_late_set_does_not_displace_a_set_with_a_descendant() {
+    let mut wallet = Wallet::new();
+    let fresh = wallet.run.coordinator.clone();
+    let ray = details("Ray", 0xd1, 0xd2);
+    let digest_from_empty = |details: &SpContactDetails| {
+        ContactChangeSet {
+            head: frostsnap_core::silent_payments::BookHead::empty(),
+            changes: vec![ContactChange::Add(details.clone())],
+        }
+        .digest(NETWORK)
+    };
+    // A late set whose digest is smaller than Ray's, so the old rule would have picked it.
+    let late_details = (0xe0..0xf0u8)
+        .map(|byte| details("Sam", byte, byte + 0x10))
+        .find(|late| digest_from_empty(late) < digest_from_empty(&ray))
+        .unwrap();
+    let first = sign_contact(&mut wallet, ray, &[0, 1]);
+    let late = sign_contact(&mut wallet, late_details, &[1, 2]);
+    let first = wallet.run.coordinator.finish_sp_contact(first).unwrap();
+    let tom = wallet.change_book(
+        vec![ContactChange::Add(details("Tom", 0xd5, 0xd6))],
+        &[0, 2],
+    );
+    let late = wallet.run.coordinator.finish_sp_contact(late).unwrap();
+
+    let key_id = wallet.access_structure_ref.key_id;
+    let head = wallet.run.coordinator.sp_contact_book_head(key_id);
+    assert_eq!(head, tom.changes.set.next_head(NETWORK));
+    assert_eq!(wallet.names(), ["Ray", "Tom"]);
+    let book = wallet.run.coordinator.sp_contact_book(key_id).unwrap();
+    assert_eq!(book.dropped(), [&late]);
+
+    let mut other = fresh;
+    for signed in [late, tom, first] {
+        other.add_sp_contact_changes(key_id, signed).unwrap();
+    }
+    assert_eq!(other.sp_contact_book_head(key_id), head);
+    assert_eq!(other.sp_contact_book(key_id).unwrap().dropped().len(), 1);
 }
 
 /// The proofs of a contact's signing session are in memory, like its ECDH shares, so they never
@@ -923,4 +1053,303 @@ fn a_bip352_receiver_finds_every_output_paid_to_a_contact() {
         paid,
         found.iter().map(|key| key.to_vec()).collect::<Vec<_>>()
     );
+}
+
+/// One hold accepts a whole change set. Each device answers with one ECDH share per add, and the
+/// book gets every contact, each with its own signature, in one step.
+#[test]
+fn a_change_set_of_three_adds_is_one_step() {
+    let mut wallet = Wallet::new();
+    let adds = [
+        details("Ann", 0x11, 0x12),
+        details("Ben", 0x13, 0x14),
+        details("Cat", 0x15, 0x16),
+    ];
+    let changes = adds.iter().cloned().map(ContactChange::Add).collect();
+    let session_id = wallet.changes_ecdh(changes, &[0, 2]);
+    let session = wallet
+        .run
+        .coordinator
+        .sp_contact_session(session_id)
+        .unwrap();
+    assert!(session.shares.values().all(|shares| shares.len() == 3));
+
+    let sign_session = wallet
+        .run
+        .coordinator
+        .start_sp_contact_sign(session_id, &mut wallet.rng)
+        .unwrap();
+    for device in wallet.signers(&[0, 2]) {
+        let request =
+            wallet
+                .run
+                .coordinator
+                .request_device_sign(sign_session, device, TEST_ENCRYPTION_KEY);
+        wallet.run.extend(request);
+    }
+    wallet
+        .run
+        .run_until_finished(&mut wallet.env, &mut wallet.rng)
+        .unwrap();
+    let signed = wallet
+        .run
+        .coordinator
+        .finish_sp_contact(sign_session)
+        .unwrap();
+
+    assert!(signed.verify(wallet.master, NETWORK));
+    assert_eq!(signed.signatures.len(), 3);
+    assert_eq!(wallet.names(), ["Ann", "Ben", "Cat"]);
+    let key_id = wallet.access_structure_ref.key_id;
+    assert_eq!(
+        wallet.run.coordinator.sp_contact_book_head(key_id).version,
+        1
+    );
+    for contact in wallet.run.coordinator.sp_contacts(key_id) {
+        assert!(contact.verify(wallet.master, NETWORK));
+    }
+}
+
+/// A rename is a remove and an add in one set. Removes apply first, so the new name can even be
+/// the old one in another case.
+#[test]
+fn a_rename_is_one_change_set() {
+    let mut wallet = Wallet::new();
+    let bob = details("Bob", 0x21, 0x22);
+    wallet.add_contact(bob.clone(), &[0, 1]);
+
+    let mut robert = bob.clone();
+    robert.name = "Robert".into();
+    wallet.change_book(
+        vec![
+            ContactChange::Add(robert.clone()),
+            ContactChange::Remove(bob.clone()),
+        ],
+        &[1, 2],
+    );
+    assert_eq!(wallet.names(), ["Robert"]);
+    let renamed = wallet.contact("Robert").unwrap();
+    assert!(renamed.verify(wallet.master, NETWORK));
+    let key_id = wallet.access_structure_ref.key_id;
+    assert_eq!(
+        wallet.run.coordinator.sp_contact_book_head(key_id).version,
+        2
+    );
+
+    let mut lowercase = robert.clone();
+    lowercase.name = "robert".into();
+    wallet.change_book(
+        vec![ContactChange::Remove(robert), ContactChange::Add(lowercase)],
+        &[0, 2],
+    );
+    assert_eq!(wallet.names(), ["robert"]);
+}
+
+/// A set that does not apply to the book is refused before any device is asked.
+#[test]
+fn a_change_set_must_apply_to_the_book() {
+    let mut wallet = Wallet::new();
+    let ann = details("Ann", 0x31, 0x32);
+    wallet.add_contact(ann.clone(), &[0, 1]);
+    let signers = wallet.signers(&[0, 1]);
+    let start = |wallet: &mut Wallet, set: ContactChangeSet| {
+        wallet.run.coordinator.start_sp_contact(
+            wallet.access_structure_ref,
+            set,
+            &signers,
+            TEST_ENCRYPTION_KEY,
+            &mut wallet.rng,
+        )
+    };
+
+    // A remove of an address the book has under another name.
+    let mut other_name = ann.clone();
+    other_name.name = "Anne".into();
+    let set = wallet.change_set(vec![ContactChange::Remove(other_name)]);
+    assert!(matches!(
+        start(&mut wallet, set),
+        Err(StartSignError::SpContactChanges(
+            ChangeSetError::NoSuchContact
+        ))
+    ));
+
+    // An add under a name still in use after the removes.
+    let set = wallet.change_set(vec![
+        ContactChange::Remove(ann.clone()),
+        ContactChange::Add(details("Bea", 0x33, 0x34)),
+        ContactChange::Add(details("bea", 0x35, 0x36)),
+    ]);
+    assert!(matches!(
+        start(&mut wallet, set),
+        Err(StartSignError::SignTask(
+            SignTaskError::SilentPaymentInvalidContactChanges
+        ))
+    ));
+
+    // A set started from an older head.
+    let mut set = wallet.change_set(vec![ContactChange::Add(details("Cy", 0x37, 0x38))]);
+    set.head = frostsnap_core::silent_payments::BookHead::empty();
+    assert!(matches!(
+        start(&mut wallet, set),
+        Err(StartSignError::SpContactChanges(ChangeSetError::WrongHead))
+    ));
+}
+
+/// A share whose proof doesn't check is refused when it arrives, and the device stays unanswered.
+#[test]
+fn a_tampered_contact_share_is_refused_on_arrival() {
+    use frostsnap_core::message::{signing::DeviceSigning, DeviceToCoordinatorMessage};
+    let mut wallet = Wallet::new();
+    let session_id = wallet.contact_ecdh(details("Dee", 0x41, 0x42), &[0, 1]);
+    let device = wallet.devices[0];
+    let shares = wallet
+        .run
+        .coordinator
+        .sp_contact_session(session_id)
+        .unwrap()
+        .shares[&device]
+        .clone();
+    wallet.run.coordinator.forget_sp_contact_shares_from(device);
+
+    let send = |wallet: &mut Wallet, shares: Vec<_>| {
+        wallet.run.coordinator.recv_device_message(
+            device,
+            DeviceToCoordinatorMessage::Signing(DeviceSigning::SpContactEcdhShare {
+                session_id,
+                shares,
+            }),
+        )
+    };
+    let mut tampered = shares.clone();
+    tampered[0].proof[0] ^= 1;
+    assert!(send(&mut wallet, tampered).is_err());
+    let mut other_point = shares.clone();
+    other_point[0].ecdh_share = public(scalar(0x43));
+    assert!(send(&mut wallet, other_point).is_err());
+    assert!(send(&mut wallet, vec![]).is_err());
+    assert!(!wallet
+        .run
+        .coordinator
+        .sp_contact_session(session_id)
+        .unwrap()
+        .shares
+        .contains_key(&device));
+
+    assert!(send(&mut wallet, shares).is_ok());
+}
+
+/// A signed change set from another coordinator only touches the book if it is this wallet's on
+/// this network.
+#[test]
+fn a_forged_change_set_is_refused() {
+    let mut wallet = Wallet::new();
+    let fresh = wallet.run.coordinator.clone();
+    let signed = wallet.change_book(
+        vec![ContactChange::Add(details("Eve", 0x51, 0x52))],
+        &[0, 1],
+    );
+    let key_id = wallet.access_structure_ref.key_id;
+
+    let other_wallet = MasterAppkey::derive_from_rootkey(G.normalize());
+    assert!(!signed.verify(other_wallet, NETWORK));
+    assert!(!signed.verify(wallet.master, Network::Testnet));
+
+    let mut forged_signature = signed.clone();
+    forged_signature.signatures[0][63] ^= 1;
+    let mut moved = signed.clone();
+    moved.changes.set.head = wallet.run.coordinator.sp_contact_book_head(key_id);
+    let mut other_ecdh = signed.clone();
+    other_ecdh.changes.account_ecdh[0] = public(scalar(0x53));
+    let mut renamed = signed.clone();
+    renamed.changes.set.changes[0] = ContactChange::Add(details("Mallory", 0x51, 0x52));
+
+    let mut other = fresh;
+    for forged in [forged_signature, moved, other_ecdh, renamed] {
+        assert!(other.add_sp_contact_changes(key_id, forged).is_err());
+    }
+    assert_eq!(
+        other.sp_contact_book_head(key_id),
+        frostsnap_core::silent_payments::BookHead::empty()
+    );
+    other.add_sp_contact_changes(key_id, signed).unwrap();
+    assert_eq!(
+        other.sp_contact_book_head(key_id),
+        wallet.run.coordinator.sp_contact_book_head(key_id)
+    );
+}
+
+/// A coordinator that missed a change set waits for it, a replayed old set changes nothing, and
+/// sets arriving in any order give the same book.
+#[test]
+fn the_book_folds_the_same_whatever_the_arrival_order() {
+    let mut wallet = Wallet::new();
+    let fresh = wallet.run.coordinator.clone();
+    let ann = details("Ann", 0x61, 0x62);
+    let add_ann = wallet.change_book(vec![ContactChange::Add(ann.clone())], &[0, 1]);
+    let add_ben = wallet.change_book(
+        vec![ContactChange::Add(details("Ben", 0x63, 0x64))],
+        &[1, 2],
+    );
+    let remove_ann = wallet.change_book(vec![ContactChange::Remove(ann)], &[0, 2]);
+    let key_id = wallet.access_structure_ref.key_id;
+    let head = wallet.run.coordinator.sp_contact_book_head(key_id);
+    assert_eq!(head.version, 3);
+    assert_eq!(wallet.names(), ["Ben"]);
+
+    // The first set is missing: the later ones wait for it.
+    let mut other = fresh;
+    other
+        .add_sp_contact_changes(key_id, remove_ann.clone())
+        .unwrap();
+    other.add_sp_contact_changes(key_id, add_ben).unwrap();
+    assert_eq!(
+        other.sp_contact_book_head(key_id),
+        frostsnap_core::silent_payments::BookHead::empty()
+    );
+    assert_eq!(other.sp_contacts(key_id).count(), 0);
+    assert!(other
+        .sp_contact_book(key_id)
+        .unwrap()
+        .is_waiting_for_missing_set());
+
+    other
+        .add_sp_contact_changes(key_id, add_ann.clone())
+        .unwrap();
+    assert_eq!(other.sp_contact_book_head(key_id), head);
+    let book = other.sp_contact_book(key_id).unwrap();
+    assert!(!book.is_waiting_for_missing_set());
+    assert!(book.has_passed(&frostsnap_core::silent_payments::BookHead::empty()));
+    assert!(book.has_passed(&head));
+    let after_ann = add_ann.changes.set.next_head(NETWORK);
+    assert!(book.has_passed(&after_ann));
+    assert!(book.applied(&add_ann.changes.set.digest(NETWORK)));
+    assert_eq!(
+        book.sets_after(&after_ann)
+            .iter()
+            .map(|signed| signed.changes.set.head.version)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert!(book.sets_after(&head).is_empty());
+    assert_eq!(
+        other.sp_contacts(key_id).collect::<Vec<_>>(),
+        wallet
+            .run
+            .coordinator
+            .sp_contacts(key_id)
+            .collect::<Vec<_>>()
+    );
+
+    // Republishing the set that added Ann does not bring her back.
+    other.add_sp_contact_changes(key_id, add_ann).unwrap();
+    wallet
+        .run
+        .coordinator
+        .add_sp_contact_changes(key_id, remove_ann)
+        .unwrap();
+    assert_eq!(other.sp_contact_book_head(key_id), head);
+    assert_eq!(wallet.names(), ["Ben"]);
+    assert!(other
+        .sp_contacts(key_id)
+        .all(|contact| contact.contact.details.name == "Ben"));
 }
